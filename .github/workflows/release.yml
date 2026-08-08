@@ -5,7 +5,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths-ignore: ['*.md', 'docs/**', '.github/**']
+    paths-ignore: ['*.md', 'docs/**', '.github/**', 'renovate.json5', '.pre-commit-config.yaml', 'Makefile', '.gitignore', 'LICENSE']
   workflow_dispatch:
     inputs:
       version:
