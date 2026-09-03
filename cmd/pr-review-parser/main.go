@@ -10,8 +10,9 @@
 // Usage:
 //
 //	pr-review-parser <pr-number> [--format json|consensus] [--include-resolved]
-//	    [--authors <csv>] [--include-self] [--include-outdated]
-//	    [--since <ref|RFC3339>] [--since-last-commit] [--since-last-push]
+//	    [--authors <csv>] [--trusted-authors <csv>] [--include-self]
+//	    [--include-outdated] [--since <ref|RFC3339>] [--since-last-commit]
+//	    [--since-last-push]
 package main
 
 import (
@@ -24,32 +25,43 @@ import (
 	"github.com/djdembeck/pr-review-tools/internal/review"
 )
 
-func main() {
-	args := os.Args[1:]
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, `Usage: pr-review-parser <pr-number> [flags]
+const usageText = `Usage: pr-review-parser <pr-number> [flags]
 
 Flags:
   --format json|consensus   Output format (default: json)
   --include-resolved        Include resolved threads (default: exclude)
   --authors <csv>           Only include root comments from these logins (default: all reviewers)
+  --trusted-authors <csv>   Additional trusted author logins (agent prompts are only emitted for trusted authors: bot-suffixed logins or these entries).
+                            Warning: ANY login ending in 'bot' (case-insensitive) is trusted automatically — a human reviewer with such a login has their agent prompts emitted, and there is no flag to un-trust them.
   --include-self            Include comments authored by the authenticated user (default: exclude)
   --include-outdated        Include outdated threads (default: exclude)
   --since <ref|RFC3339>     Only comments created after this git ref's commit time or timestamp
   --since-last-commit       Only comments created after HEAD
   --since-last-push         Only comments created after the upstream tracking branch (@{u})
-  --help, -h                Show this help`)
+  --help, -h                Show this help`
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, usageText)
+}
+
+func main() {
+	args := os.Args[1:]
+	if len(args) == 0 {
+		printUsage()
 		os.Exit(1)
 	}
-
-	prNumber, err := strconv.Atoi(args[0])
-	if err != nil || prNumber <= 0 {
-		fmt.Fprintf(os.Stderr, "Invalid PR number: %s\n", args[0])
+	prNumber, showHelp, headErr := parseHead(args)
+	if showHelp {
+		printUsage()
+		os.Exit(0)
+	}
+	if headErr != "" {
+		fmt.Fprintln(os.Stderr, headErr)
 		os.Exit(1)
 	}
 
 	const (
-		usageLine = "Usage: pr-review-parser <pr-number> [--format json|consensus] [--include-resolved] [--authors <csv>] [--include-self] [--include-outdated] [--since <ref|RFC3339>] [--since-last-commit] [--since-last-push]"
+		usageLine = "Usage: pr-review-parser <pr-number> [--format json|consensus] [--include-resolved] [--authors <csv>] [--trusted-authors <csv>] [--include-self] [--include-outdated] [--since <ref|RFC3339>] [--since-last-commit] [--since-last-push]"
 	)
 
 	format := "json"
@@ -57,6 +69,7 @@ Flags:
 	includeSelf := false
 	includeOutdated := false
 	var authors []string
+	var trustedAuthors []string
 	var sinceFlag string
 	sinceLastCommit := false
 	sinceLastPush := false
@@ -65,30 +78,26 @@ Flags:
 		switch args[i] {
 		case "--authors":
 			if i+1 < len(args) {
-				val := args[i+1]
-				// GitHub/Forgejo logins cannot start with "-", so reject
-				// "--"-prefixed tokens to catch misplaced flags.
-				if strings.HasPrefix(val, "--") {
-					fmt.Fprintf(os.Stderr, "Error: --authors got flag-shaped value '%s', expected CSV of author logins\n", val)
-					os.Exit(1)
-				}
-				prev := len(authors)
-				for _, a := range strings.Split(val, ",") {
-					if a = strings.TrimSpace(a); a != "" {
-						if strings.HasPrefix(a, "--") {
-							fmt.Fprintf(os.Stderr, "Error: --authors got flag-shaped author '%s', expected login\n", a)
-							os.Exit(1)
-						}
-						authors = append(authors, a)
-					}
-				}
-				if len(authors) == prev {
+				authors = append(authors, parseCSVLogins("authors", args[i+1])...)
+				if len(authors) == 0 {
 					fmt.Fprintln(os.Stderr, "Error: --authors requires a non-empty value")
 					os.Exit(1)
 				}
 				i++
 			} else {
 				fmt.Fprintln(os.Stderr, "Error: --authors requires a non-empty value")
+				os.Exit(1)
+			}
+		case "--trusted-authors":
+			if i+1 < len(args) {
+				trustedAuthors = append(trustedAuthors, parseCSVLogins("trusted-authors", args[i+1])...)
+				if len(trustedAuthors) == 0 {
+					fmt.Fprintln(os.Stderr, "Error: --trusted-authors requires a non-empty value")
+					os.Exit(1)
+				}
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --trusted-authors requires a non-empty value")
 				os.Exit(1)
 			}
 		case "--format":
@@ -123,9 +132,6 @@ Flags:
 			sinceLastCommit = true
 		case "--since-last-push":
 			sinceLastPush = true
-		case "--help", "-h":
-			fmt.Fprintln(os.Stderr, "Usage: pr-review-parser <pr-number> [flags]; run with no arguments for full flag help")
-			os.Exit(0)
 		default:
 			fmt.Fprintf(os.Stderr, "Error: unknown flag '%s'\n", args[i])
 			fmt.Fprintln(os.Stderr, usageLine)
@@ -183,7 +189,7 @@ Flags:
 
 	parsed := make([]review.ParsedComment, 0, len(roots))
 	for _, c := range roots {
-		parsed = append(parsed, review.ParseComment(c))
+		parsed = append(parsed, review.ParseCommentTrusted(c, trustedAuthors))
 	}
 
 	if !includeResolved {
@@ -209,17 +215,11 @@ Flags:
 	}
 
 	if !includeSelf {
-		selfLogin, err := review.SelfLogin(platform)
-		if err != nil || selfLogin == "" {
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "- Warning: could not determine authenticated user (%v); skipping self-comment exclusion\n", err)
-			}
-		} else {
-			before := len(parsed)
-			parsed = filterOutSelf(parsed, selfLogin)
-			if removed := before - len(parsed); removed > 0 {
-				fmt.Fprintf(os.Stderr, "- Excluded %d self-authored comment(s) (author: %s)\n", removed, selfLogin)
-			}
+		var err error
+		parsed, err = excludeSelf(parsed, platform)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
@@ -261,6 +261,70 @@ Flags:
 	}
 
 	fmt.Println(output)
+}
+
+// parseHead validates the positional PR number and reports a help request
+// without touching os.Exit so it can be unit-tested. It returns the PR number,
+// whether the user requested help, and an error message ("" on success).
+// --help / -h wins regardless of position or PR-number validity.
+func parseHead(args []string) (int, bool, string) {
+	for _, a := range args {
+		if a == "--help" || a == "-h" {
+			return 0, true, ""
+		}
+	}
+	prNumber, err := strconv.Atoi(args[0])
+	if err != nil || prNumber <= 0 {
+		return 0, false, "Invalid PR number: " + args[0]
+	}
+	return prNumber, false, ""
+}
+
+// parseCSVLogins splits a comma-separated author login list into trimmed
+// non-empty logins. GitHub/Forgejo logins cannot start with "-", so reject
+// "--"-prefixed tokens to catch misplaced flags.
+func parseCSVLogins(flag, val string) []string {
+	if strings.HasPrefix(val, "--") {
+		fmt.Fprintf(os.Stderr, "Error: %s got flag-shaped value '%s', expected CSV of logins\n", flag, val)
+		os.Exit(1)
+	}
+	var out []string
+	for _, a := range strings.Split(val, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			if strings.HasPrefix(a, "--") {
+				fmt.Fprintf(os.Stderr, "Error: %s got flag-shaped login '%s', expected login\n", flag, a)
+				os.Exit(1)
+			}
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// selfLoginFunc resolves the authenticated login; a seam so tests can stub
+// review.SelfLogin without hitting gh or the Forgejo API.
+var selfLoginFunc = review.SelfLogin
+
+// excludeSelf drops parsed comments authored by the authenticated user. It
+// fails closed: if the login cannot be determined, it returns an error
+// instead of silently passing comments through unfiltered — on Forgejo,
+// replies resurface as roots, so an unfiltered set would include the
+// agent's own comments. Users who intentionally want unfiltered output opt
+// in explicitly with --include-self.
+func excludeSelf(comments []review.ParsedComment, platform review.Platform) ([]review.ParsedComment, error) {
+	selfLogin, err := selfLoginFunc(platform)
+	if err != nil {
+		return nil, fmt.Errorf("could not determine authenticated user: %w (pass --include-self to skip self-comment exclusion)", err)
+	}
+	if selfLogin == "" {
+		return nil, fmt.Errorf("could not determine authenticated user (empty login) (pass --include-self to skip self-comment exclusion)")
+	}
+	before := len(comments)
+	filtered := filterOutSelf(comments, selfLogin)
+	if removed := before - len(filtered); removed > 0 {
+		fmt.Fprintf(os.Stderr, "- Excluded %d self-authored comment(s) (author: %s)\n", removed, selfLogin)
+	}
+	return filtered, nil
 }
 
 // filterOutSelf drops parsed comments authored by selfLogin (case-insensitive).

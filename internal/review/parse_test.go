@@ -1,6 +1,7 @@
 package review
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,5 +145,125 @@ func TestFilterSince(t *testing.T) {
 	}
 	if !byID["garbage-ts"] {
 		t.Fatal("unparseable timestamp must fail open (kept)")
+	}
+}
+
+// TestIsTrustedAuthor verifies the deterministic trust classification:
+// bot-suffixed logins are trusted (case-insensitive), --trusted-authors
+// entries are trusted (case-insensitive, trimmed), and plain human logins
+// are not.
+func TestIsTrustedAuthor(t *testing.T) {
+	cases := []struct {
+		author  string
+		extra   []string
+		trusted bool
+	}{
+		{"miracodeai-bot", nil, true},
+		{"nimuebot", nil, true},
+		{"NIMUEBOT", nil, true},
+		{"some-thing-bot", nil, true},
+		{"robot", nil, true},
+		{"human-reviewer", nil, false},
+		{"copilot", nil, false}, // not bot-suffixed; trusted only via the list
+		{"copilot", []string{"copilot"}, true},
+		{"Copilot", []string{" Copilot "}, true},
+		{"mira", []string{"Mira"}, true},
+		{"mira", []string{"nimuebot"}, false},
+		{"", nil, false},
+		{"", []string{""}, false},
+	}
+	for _, tc := range cases {
+		if got := IsTrustedAuthor(tc.author, tc.extra...); got != tc.trusted {
+			t.Errorf("IsTrustedAuthor(%q, %v) = %v, want %v", tc.author, tc.extra, got, tc.trusted)
+		}
+	}
+}
+
+const agentPromptBody = "**Bug**\n" +
+	"🛑\n" +
+	"**Missing null check**\n" +
+	"\n" +
+	"The check is absent.\n" +
+	"\n" +
+	"<details>\n" +
+	"<summary>Prompt for AI Agents</summary>\n" +
+	"\n" +
+	"```\n" +
+	"Fix the null check in auth.ts\n" +
+	"```\n" +
+	"\n" +
+	"</details>"
+
+// TestParseCommentAgentPromptTrustGating verifies the trust boundary: an
+// embedded agent prompt is emitted only for trusted authors (bot-suffixed
+// logins by default, --trusted-authors entries when listed). Untrusted
+// authors must get a nil AgentPrompt even when their body contains a prompt.
+func TestParseCommentAgentPromptTrustGating(t *testing.T) {
+	cases := []struct {
+		name           string
+		author         string
+		trustedAuthors []string
+		wantTrusted    bool
+		wantPrompt     bool
+	}{
+		{"bot author default", "nimuebot", nil, true, true},
+		{"bot author case-insensitive", "MiracodeAI-BOT", nil, true, true},
+		{"human author default", "human-reviewer", nil, false, false},
+		{"human author via trusted list", "human-reviewer", []string{"human-reviewer"}, true, true},
+		{"unlisted author with trusted list", "copilot", []string{"nimuebot"}, false, false},
+		{"bot author with trusted list", "nimuebot", []string{"copilot"}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ParseCommentTrusted(RawComment{ID: "1", Author: tc.author, Body: agentPromptBody}, tc.trustedAuthors)
+			if got.IsTrusted != tc.wantTrusted {
+				t.Errorf("IsTrusted = %v, want %v", got.IsTrusted, tc.wantTrusted)
+			}
+			if tc.wantPrompt {
+				if got.AgentPrompt == nil || *got.AgentPrompt != "Fix the null check in auth.ts" {
+					t.Fatalf("AgentPrompt = %v, want populated prompt", got.AgentPrompt)
+				}
+			} else if got.AgentPrompt != nil {
+				t.Fatalf("AgentPrompt = %q, want nil for untrusted author", *got.AgentPrompt)
+			}
+		})
+	}
+}
+
+// TestParseCommentPromptAbsent verifies a trusted author without a prompt
+// block still gets a nil AgentPrompt, and the plain ParseComment wrapper
+// (no trusted-authors list) is equivalent to ParseCommentTrusted with nil.
+func TestParseCommentPromptAbsent(t *testing.T) {
+	got := ParseComment(RawComment{ID: "1", Author: "nimuebot", Body: "**Bug**\n🛑\n"})
+	if got.AgentPrompt != nil {
+		t.Fatal("trusted author without a prompt block must have nil AgentPrompt")
+	}
+	if !got.IsTrusted {
+		t.Fatal("nimuebot must be trusted")
+	}
+
+	wrapper := ParseComment(RawComment{ID: "2", Author: "human-reviewer", Body: agentPromptBody})
+	explicit := ParseCommentTrusted(RawComment{ID: "2", Author: "human-reviewer", Body: agentPromptBody}, nil)
+	if wrapper.IsTrusted != explicit.IsTrusted || wrapper.AgentPrompt != explicit.AgentPrompt {
+		t.Fatal("ParseComment must be equivalent to ParseCommentTrusted with a nil list")
+	}
+	if wrapper.AgentPrompt != nil || wrapper.IsTrusted {
+		t.Fatal("human author via wrapper must be untrusted with nil prompt")
+	}
+}
+
+// TestFormatConsensusTrustMarker verifies consensus rows carry the trust
+// marker so untrusted findings are visibly distinct from trusted ones.
+func TestFormatConsensusTrustMarker(t *testing.T) {
+	comments := []ParsedComment{
+		{ID: "1", File: "a.ts", LineStart: 1, Category: "Bug", Severity: SeverityBlocker, Title: "T1", Author: "nimuebot", IsTrusted: true, Body: "finding one"},
+		{ID: "2", File: "a.ts", LineStart: 5, Category: "Nit", Severity: SeverityNitpick, Title: "T2", Author: "human-reviewer", Body: "finding two"},
+	}
+	out := FormatConsensus(comments)
+	if !strings.Contains(out, "| 🤖 trusted") {
+		t.Fatal("trusted row must carry the trust marker")
+	}
+	if !strings.Contains(out, "| untrusted (no agent prompt)") {
+		t.Fatal("untrusted row must carry the untrusted marker")
 	}
 }

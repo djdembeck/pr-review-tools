@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
-// GITHUB_GRAPHQL is the query used to fetch all review threads and their
-// comments for a PR. Identical to the TS source.
-const GITHUB_GRAPHQL = `query($owner: String!, $repo: String!, $pr: Int!) {
+// GITHUB_GRAPHQL fetches one page (100) of review threads, each carrying its
+// first page (50) of comments, plus the pagination cursor for the next page.
+const GITHUB_GRAPHQL = `query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
         nodes {
           id
           isResolved
@@ -31,12 +32,55 @@ const GITHUB_GRAPHQL = `query($owner: String!, $repo: String!, $pr: Int!) {
               createdAt
               replyTo { databaseId }
             }
+            pageInfo { hasNextPage endCursor }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
 }`
+
+// GITHUB_THREAD_COMMENTS_QUERY fetches one page (50) of a single review
+// thread's comments, used to continue paginating threads that have more than
+// 50 comments. It resolves the thread through the generic node(id:) interface
+// because PullRequest has no singular reviewThread field (only reviewThreads),
+// so repository.pullRequest.reviewThread is not a valid GraphQL path.
+const GITHUB_THREAD_COMMENTS_QUERY = `query($owner: String!, $repo: String!, $pr: Int!, $threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 50, after: $after) {
+        nodes {
+          databaseId
+          body
+          author { login }
+          path
+          line
+          originalLine
+          startLine
+          originalStartLine
+          diffHunk
+          createdAt
+          replyTo { databaseId }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`
+
+// ghRun executes the gh CLI. Overridable in tests to avoid shelling out.
+var ghRun func(args []string) (string, error) = runGh
+
+// ghRunMu protects ghRun from concurrent reads/writes.
+var ghRunMu sync.RWMutex
+
+// ghRunGuarded executes the gh CLI through the overridable ghRun seam.
+func ghRunGuarded(args []string) (string, error) {
+	ghRunMu.RLock()
+	defer ghRunMu.RUnlock()
+	return ghRun(args)
+}
 
 // runGh executes the gh CLI with the given args and returns trimmed stdout. A
 // non-zero exit produces an error carrying stderr.
@@ -56,41 +100,138 @@ func runGh(args []string) (string, error) {
 }
 
 // FetchGitHubComments fetches all review-thread comments for the given PR via
-// the gh CLI GraphQL endpoint and normalizes them into RawComment values.
+// the gh CLI GraphQL endpoint, fully paginating both the reviewThreads
+// connection (100 per page) and each thread's comments connection (50 per
+// page), and normalizes the accumulated comments into RawComment values.
 func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error) {
-	output, err := runGh([]string{
-		"api", "graphql",
-		"-F", "query=" + GITHUB_GRAPHQL,
-		"-F", "owner=" + owner,
-		"-F", "repo=" + repo,
-		"-F", fmt.Sprintf("pr=%d", prNumber),
-	})
-	if err != nil {
-		return nil, err
+	var threads []ghThread
+	cursor := ""
+	for {
+		args := []string{
+			"api", "graphql",
+			"-F", "query=" + GITHUB_GRAPHQL,
+			"-F", "owner=" + owner,
+			"-F", "repo=" + repo,
+			"-F", fmt.Sprintf("pr=%d", prNumber),
+		}
+		if cursor != "" {
+			args = append(args, "-F", "after="+cursor)
+		}
+		output, err := ghRunGuarded(args)
+		if err != nil {
+			return nil, err
+		}
+		var resp graphQLResponse
+		if err := checkGitHubGraphQLPage(&resp, output); err != nil {
+			return nil, err
+		}
+		page := resp.Data.Repository.PullRequest.ReviewThreads
+		threads = append(threads, page.Nodes...)
+		if !page.PageInfo.HasNextPage {
+			break
+		}
+		cursor = page.PageInfo.EndCursor
 	}
-	return parseGitHubGraphQLResponse(output)
+
+	// Threads may have more than 50 comments; paginate the remainder via the
+	// generic node(id:) interface (PullRequest has no singular reviewThread
+	// field).
+	for i := range threads {
+		pageInfo := threads[i].Comments.PageInfo
+		for pageInfo.HasNextPage {
+			args := []string{
+				"api", "graphql",
+				"-F", "query=" + GITHUB_THREAD_COMMENTS_QUERY,
+				"-F", "owner=" + owner,
+				"-F", "repo=" + repo,
+				"-F", fmt.Sprintf("pr=%d", prNumber),
+				"-F", "threadId=" + threads[i].ID,
+				"-F", "after=" + pageInfo.EndCursor,
+			}
+			output, err := ghRunGuarded(args)
+			if err != nil {
+				return nil, err
+			}
+			var resp graphQLThreadCommentsResponse
+			if err := checkGitHubThreadCommentsPage(&resp, output); err != nil {
+				return nil, err
+			}
+			if resp.Data.Node == nil {
+				return nil, fmt.Errorf("reviewThread %s not found while paginating comments", threads[i].ID)
+			}
+			threads[i].Comments.Nodes = append(threads[i].Comments.Nodes, resp.Data.Node.Comments.Nodes...)
+			pageInfo = resp.Data.Node.Comments.PageInfo
+		}
+	}
+
+	return mapThreadsToRawComments(threads), nil
 }
 
-// parseGitHubGraphQLResponse decodes the GraphQL JSON and maps threads+comments
-// into RawComment values. Mirrors the TS parsing logic including the
-// line ?? originalLine and startLine ?? originalStartLine fallbacks.
-func parseGitHubGraphQLResponse(raw string) ([]RawComment, error) {
-	var resp graphQLResponse
-	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
-		return nil, fmt.Errorf("invalid GraphQL response: %w", err)
+// checkGitHubGraphQLPage unmarshals a GITHUB_GRAPHQL response page and reports
+// GraphQL errors or a missing data envelope.
+func checkGitHubGraphQLPage(resp *graphQLResponse, raw string) error {
+	if err := json.Unmarshal([]byte(raw), resp); err != nil {
+		return fmt.Errorf("invalid GraphQL response: %w", err)
 	}
-	if len(resp.Errors) > 0 {
-		msg := resp.Errors[0].Message
-		if msg == "" {
-			msg = "unknown"
-		}
-		return nil, fmt.Errorf("GraphQL error: %s", msg)
+	if msg := graphQLErrorMessage(resp.Errors); msg != "" {
+		return fmt.Errorf("GraphQL error: %s", msg)
 	}
 	if resp.Data == nil || resp.Data.Repository == nil || resp.Data.Repository.PullRequest == nil {
-		return nil, fmt.Errorf("no pull request data in GraphQL response")
+		return fmt.Errorf("no pull request data in GraphQL response")
 	}
+	return nil
+}
 
-	threads := resp.Data.Repository.PullRequest.ReviewThreads.Nodes
+// checkGitHubThreadCommentsPage unmarshals a GITHUB_THREAD_COMMENTS_QUERY
+// response page and reports GraphQL errors or a missing data envelope.
+func checkGitHubThreadCommentsPage(resp *graphQLThreadCommentsResponse, raw string) error {
+	if err := json.Unmarshal([]byte(raw), resp); err != nil {
+		return fmt.Errorf("invalid GraphQL response: %w", err)
+	}
+	if msg := graphQLErrorMessage(resp.Errors); msg != "" {
+		return fmt.Errorf("GraphQL error: %s", msg)
+	}
+	if resp.Data.Node == nil {
+		return fmt.Errorf("no review thread data in GraphQL response")
+	}
+	return nil
+}
+
+// graphQLErrorMessage returns the first GraphQL error's message, "unknown"
+// when the first error has no message, or "" when there are no errors.
+func graphQLErrorMessage(errors []graphQLError) string {
+	if len(errors) == 0 {
+		return ""
+	}
+	if msg := errors[0].Message; msg != "" {
+		return msg
+	}
+	return "unknown"
+}
+
+// graphQLThreadCommentsResponse is the response for GITHUB_THREAD_COMMENTS_QUERY.
+type graphQLThreadCommentsResponse struct {
+	Data struct {
+		Node *ghThread `json:"node"`
+	} `json:"data"`
+	Errors []graphQLError `json:"errors"`
+}
+
+// parseGitHubGraphQLResponse decodes a single GraphQL page and maps
+// threads+comments into RawComment values. Mirrors the TS parsing logic
+// including the line ?? originalLine and startLine ?? originalStartLine
+// fallbacks.
+func parseGitHubGraphQLResponse(raw string) ([]RawComment, error) {
+	var resp graphQLResponse
+	if err := checkGitHubGraphQLPage(&resp, raw); err != nil {
+		return nil, err
+	}
+	return mapThreadsToRawComments(resp.Data.Repository.PullRequest.ReviewThreads.Nodes), nil
+}
+
+// mapThreadsToRawComments maps fully-populated threads (all comment pages
+// accumulated) into RawComment values.
+func mapThreadsToRawComments(threads []ghThread) []RawComment {
 	comments := make([]RawComment, 0, len(threads))
 	for _, thread := range threads {
 		nodes := thread.Comments.Nodes
@@ -154,7 +295,7 @@ func parseGitHubGraphQLResponse(raw string) ([]RawComment, error) {
 		}
 	}
 
-	return comments, nil
+	return comments
 }
 
 // PostGitHubReply posts a reply to a review comment via the gh CLI REST API.
@@ -164,7 +305,7 @@ func PostGitHubReply(owner, repo string, prNumber int, commentID, body string, d
 	if dryRun {
 		return ReplyResult{Success: true}, nil
 	}
-	output, err := runGh([]string{
+	output, err := ghRunGuarded([]string{
 		"api", "-X", "POST",
 		fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%s/replies", owner, repo, prNumber, commentID),
 		"-f", "body=" + body,
@@ -182,13 +323,16 @@ func PostGitHubReply(owner, repo string, prNumber int, commentID, body string, d
 }
 
 // DetectGitHubBotName queries the PR's review threads for the first Mira author
-// and returns the login with a trailing "[bot]" suffix stripped. Falls back to
+// and returns the login with a trailing "[bot]" suffix stripped. It paginates
+// the reviewThreads connection (50 per page) so a bot comment on a later page
+// is still found; it stops early at the first Mira-authored thread, so a
+// match on the first page never triggers further fetches. Falls back to
 // "miracodeai-bot" when no Mira-authored comment is found or the query fails.
 func DetectGitHubBotName(owner, repo string, prNumber int) (string, error) {
-	const query = `query($owner: String!, $repo: String!, $pr: Int!) {
+	const query = `query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 50) {
+      reviewThreads(first: 50, after: $after) {
         nodes {
           comments(first: 1) {
             nodes {
@@ -196,35 +340,48 @@ func DetectGitHubBotName(owner, repo string, prNumber int) (string, error) {
             }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
 }`
-	output, err := runGh([]string{
-		"api", "graphql",
-		"-F", "query=" + query,
-		"-F", "owner=" + owner,
-		"-F", "repo=" + repo,
-		"-F", fmt.Sprintf("pr=%d", prNumber),
-	})
-	if err != nil {
-		return "miracodeai-bot", nil
-	}
-	var resp graphQLResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return "miracodeai-bot", nil
-	}
-	if resp.Data == nil || resp.Data.Repository == nil || resp.Data.Repository.PullRequest == nil {
-		return "miracodeai-bot", nil
-	}
-	for _, thread := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
-		if len(thread.Comments.Nodes) == 0 {
-			continue
+	cursor := ""
+	for {
+		args := []string{
+			"api", "graphql",
+			"-F", "query=" + query,
+			"-F", "owner=" + owner,
+			"-F", "repo=" + repo,
+			"-F", fmt.Sprintf("pr=%d", prNumber),
 		}
-		author := thread.Comments.Nodes[0].Author
-		if author != nil && IsMiraComment(author.Login) {
-			return strings.TrimSuffix(author.Login, "[bot]"), nil
+		if cursor != "" {
+			args = append(args, "-F", "after="+cursor)
 		}
+		output, err := ghRunGuarded(args)
+		if err != nil {
+			return "miracodeai-bot", nil
+		}
+		var resp graphQLResponse
+		if err := json.Unmarshal([]byte(output), &resp); err != nil {
+			return "miracodeai-bot", nil
+		}
+		if resp.Data == nil || resp.Data.Repository == nil || resp.Data.Repository.PullRequest == nil {
+			return "miracodeai-bot", nil
+		}
+		for _, thread := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
+			if len(thread.Comments.Nodes) == 0 {
+				continue
+			}
+			author := thread.Comments.Nodes[0].Author
+			if author != nil && IsMiraComment(author.Login) {
+				return strings.TrimSuffix(author.Login, "[bot]"), nil
+			}
+		}
+		pageInfo := resp.Data.Repository.PullRequest.ReviewThreads.PageInfo
+		if !pageInfo.HasNextPage {
+			break
+		}
+		cursor = pageInfo.EndCursor
 	}
 	return "miracodeai-bot", nil
 }
@@ -256,7 +413,7 @@ func ResolveGitHubThread(owner, repo string, prNumber int, threadID string, dryR
 	if dryRun {
 		return ReplyResult{Success: true}, nil
 	}
-	output, err := runGh([]string{
+	output, err := ghRunGuarded([]string{
 		"api", "graphql",
 		"-f", "query=" + GITHUB_RESOLVE_MUTATION,
 		"-F", "threadId=" + threadID,

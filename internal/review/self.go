@@ -21,7 +21,7 @@ func SelfLogin(platform Platform) (string, error) {
 		}
 		return user.Login, nil
 	default:
-		out, err := runGh([]string{"api", "user", "--jq", ".login"})
+		out, err := ghRunGuarded([]string{"api", "user", "--jq", ".login"})
 		if err != nil {
 			return "", err
 		}

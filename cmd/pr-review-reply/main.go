@@ -6,11 +6,11 @@
 // Usage:
 //
 //	pr-review-reply <pr-number> --reject <comment-id> --reason "..."
-//	pr-review-reply <pr-number> --acknowledge <comment-id> [--commit abc123]
+//	pr-review-reply <pr-number> --acknowledge | --ack <comment-id> [--commit abc123]
 //	pr-review-reply <pr-number> --reply <comment-id> --body "..." [--and-resolve]
 //	pr-review-reply <pr-number> --batch-reply <file.json>
 //	pr-review-reply <pr-number> --batch-reject <file.json>
-//	pr-review-reply <pr-number> --batch-acknowledge <file.json>
+//	pr-review-reply <pr-number> --batch-acknowledge | --batch-ack <file.json>
 //	pr-review-reply <pr-number> --resolve <comment-id>
 //	pr-review-reply <pr-number> --detect-bot
 package main
@@ -79,16 +79,15 @@ type replyEntry struct {
 	Resolve bool   `json:"resolve"`
 }
 
-func printUsage() {
-	fmt.Fprintln(os.Stderr, `pr-review-reply — Post feedback replies to PR review threads
+const usageText = `pr-review-reply — Post feedback replies to PR review threads
 
 Usage:
   pr-review-reply <pr-number> --reply <comment-id> --body "..." [--and-resolve]
   pr-review-reply <pr-number> --batch-reply <file.json>
   pr-review-reply <pr-number> --reject <comment-id> --reason "..." [--and-resolve]
-  pr-review-reply <pr-number> --acknowledge <comment-id> [--commit abc123] [--and-resolve]
+  pr-review-reply <pr-number> --acknowledge | --ack <comment-id> [--commit abc123] [--and-resolve]
   pr-review-reply <pr-number> --batch-reject <file.json>
-  pr-review-reply <pr-number> --batch-acknowledge <file.json>
+  pr-review-reply <pr-number> --batch-acknowledge | --batch-ack <file.json>
   pr-review-reply <pr-number> --resolve <comment-id>
   pr-review-reply <pr-number> --detect-bot
 
@@ -105,154 +104,189 @@ Options:
 
 Batch files:
   --batch-reply entries: {"id": "...", "body": "...", "resolve": true}
-  --batch-reject / --batch-acknowledge entries additionally accept "resolve": true.`)
+  --batch-reject / --batch-acknowledge entries additionally accept "resolve": true.`
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, usageText)
 }
 
 func parseArgs(argv []string) args {
-	a := args{}
-	argsList := argv[1:]
-	if len(argsList) == 0 {
-		printUsage()
-		os.Exit(1)
-	}
-	// --help / -h may appear as the first arg without a PR number.
-	if isHelp(argsList[0]) {
+	a, err, showHelp := parseArgsValue(argv)
+	if showHelp {
 		printUsage()
 		os.Exit(0)
 	}
-
-	prNumber, err := strconv.Atoi(argsList[0])
-	if err != nil || prNumber <= 0 {
-		fmt.Fprintf(os.Stderr, "Invalid PR number: %s\n", argsList[0])
-		os.Exit(1)
-	}
-	a.prNumber = prNumber
-
-	for i := 1; i < len(argsList); i++ {
-		arg := argsList[i]
-		switch arg {
-		case "--reject":
-			a.act = actionReject
-			i++
-			if i < len(argsList) {
-				a.commentID = argsList[i]
-			}
-		case "--acknowledge", "--ack":
-			a.act = actionAcknowledge
-			i++
-			if i < len(argsList) {
-				a.commentID = argsList[i]
-			}
-		case "--reply":
-			a.act = actionReply
-			i++
-			if i < len(argsList) {
-				a.commentID = argsList[i]
-			}
-		case "--batch-reply":
-			a.act = actionBatchReply
-			i++
-			if i < len(argsList) {
-				a.batchFile = argsList[i]
-			}
-		case "--batch-reject":
-			a.act = actionBatchReject
-			i++
-			if i < len(argsList) {
-				a.batchFile = argsList[i]
-			}
-		case "--batch-acknowledge", "--batch-ack":
-			a.act = actionBatchAcknowledge
-			i++
-			if i < len(argsList) {
-				a.batchFile = argsList[i]
-			}
-		case "--resolve":
-			a.act = actionResolve
-			i++
-			if i < len(argsList) {
-				a.resolveTarget = argsList[i]
-			}
-		case "--and-resolve":
-			a.andResolve = true
-		case "--reason":
-			i++
-			if i < len(argsList) {
-				a.reason = argsList[i]
-			}
-		case "--body":
-			i++
-			if i < len(argsList) {
-				a.body = argsList[i]
-			}
-		case "--commit":
-			i++
-			if i < len(argsList) {
-				a.commitHash = argsList[i]
-			}
-		case "--note":
-			i++
-			if i < len(argsList) {
-				a.note = argsList[i]
-			}
-		case "--bot-name":
-			i++
-			if i < len(argsList) {
-				a.botName = argsList[i]
-			}
-		case "--detect-bot":
-			a.act = actionDetectBot
-		case "--dry-run":
-			a.dryRun = true
-		case "--format":
-			i++
-			if i < len(argsList) && argsList[i] == "json" {
-				a.formatJSON = true
-			}
-		case "--help", "-h":
-			printUsage()
-			os.Exit(0)
-		default:
-			fmt.Fprintf(os.Stderr, "Unknown argument: %s\n", arg)
-			printUsage()
-			os.Exit(1)
-		}
-	}
-
-	if a.act == "" {
-		fmt.Fprintln(os.Stderr, "Error: must specify --reply, --resolve, --reject, --acknowledge, --batch-reply, --batch-reject, --batch-acknowledge, or --detect-bot")
-		printUsage()
-		os.Exit(1)
-	}
-	if (a.act == actionReject || a.act == actionAcknowledge || a.act == actionReply) && a.commentID == "" {
-		fmt.Fprintf(os.Stderr, "Error: --%s requires a comment ID\n", a.act)
-		os.Exit(1)
-	}
-	if a.act == actionReject && a.reason == "" {
-		fmt.Fprintln(os.Stderr, "Error: --reject requires --reason")
-		os.Exit(1)
-	}
-	if a.act == actionReply && a.body == "" {
-		fmt.Fprintln(os.Stderr, "Error: --reply requires --body")
-		os.Exit(1)
-	}
-	if a.act == actionResolve && a.resolveTarget == "" {
-		fmt.Fprintln(os.Stderr, "Error: --resolve requires a comment ID")
-		os.Exit(1)
-	}
-	if a.act == actionBatchReply && a.batchFile == "" {
-		fmt.Fprintln(os.Stderr, "Error: --batch-reply requires a file path")
-		os.Exit(1)
-	}
-	if (a.act == actionBatchReject || a.act == actionBatchAcknowledge) && a.batchFile == "" {
-		fmt.Fprintf(os.Stderr, "Error: --%s requires a file path\n", a.act)
+	if err != "" {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	return a
 }
 
-// readBatchFile reads a JSON array from path. It accepts raw arrays of
-// `{id,reason}` or `{id,note}` objects.
+// parseArgsValue parses CLI arguments without touching os.Exit so it can be
+// unit-tested. It returns the parsed args, a usage error ("" on success), and
+// whether the user requested help.
+func parseArgsValue(argv []string) (args, string, bool) {
+	a := args{}
+	argsList := argv[1:]
+	if len(argsList) == 0 {
+		return a, "Usage error: missing PR number\n" + usageText + "\n", false
+	}
+	// --help / -h may appear as the first arg without a PR number.
+	if isHelp(argsList[0]) {
+		return a, "", true
+	}
+
+	prNumber, err := strconv.Atoi(argsList[0])
+	if err != nil || prNumber <= 0 {
+		return a, fmt.Sprintf("Invalid PR number: %s\n", argsList[0]), false
+	}
+	a.prNumber = prNumber
+
+	// primaryAction enforces one action per invocation: --and-resolve is a
+	// modifier, but every other action flag selects the sole action.
+	primaryAction := func(flag action, flagName string) error {
+		if a.act != "" {
+			return fmt.Errorf("error: one action per invocation; both --%s and %s were given", a.act, flagName)
+		}
+		a.act = flag
+		return nil
+	}
+
+	for i := 1; i < len(argsList); i++ {
+		arg := argsList[i]
+		// Primary action flag that takes a value. The next token must exist
+		// and must not be flag-shaped, otherwise a bare flag like --dry-run
+		// would be silently consumed as the value.
+		if flag, flagName, ok := primaryActionFlag(arg); ok {
+			if err := primaryAction(flag, flagName); err != nil {
+				return a, err.Error(), false
+			}
+			value, valueErr := optionValue(argsList, i, flagName)
+			if valueErr != "" {
+				return a, valueErr, false
+			}
+			i++
+			switch flag {
+			case actionResolve:
+				a.resolveTarget = value
+			case actionBatchReply, actionBatchReject, actionBatchAcknowledge:
+				a.batchFile = value
+			default:
+				a.commentID = value
+			}
+			continue
+		}
+		switch arg {
+		case "--and-resolve":
+			a.andResolve = true
+		case "--reason", "--body", "--commit", "--note", "--bot-name":
+			value, valueErr := optionValue(argsList, i, arg)
+			if valueErr != "" {
+				return a, valueErr, false
+			}
+			i++
+			switch arg {
+			case "--reason":
+				a.reason = value
+			case "--body":
+				a.body = value
+			case "--commit":
+				a.commitHash = value
+			case "--note":
+				a.note = value
+			case "--bot-name":
+				a.botName = value
+			}
+		case "--detect-bot":
+			if err := primaryAction(actionDetectBot, "--detect-bot"); err != nil {
+				return a, err.Error(), false
+			}
+		case "--dry-run":
+			a.dryRun = true
+		case "--format":
+			value, valueErr := optionValue(argsList, i, arg)
+			if valueErr != "" {
+				return a, valueErr, false
+			}
+			i++
+			if value == "json" {
+				a.formatJSON = true
+			}
+		case "--help", "-h":
+			return a, "", true
+		default:
+			return a, fmt.Sprintf("Unknown argument: %s\n%s\n", arg, usageText), false
+		}
+	}
+
+	if a.act == "" {
+		return a, "Error: must specify --reply, --resolve, --reject, --acknowledge, --batch-reply, --batch-reject, --batch-acknowledge, or --detect-bot\n" + usageText + "\n", false
+	}
+	if (a.act == actionReject || a.act == actionAcknowledge || a.act == actionReply) && a.commentID == "" {
+		return a, fmt.Sprintf("Error: --%s requires a comment ID\n", a.act), false
+	}
+	if a.act == actionReject && a.reason == "" {
+		return a, "Error: --reject requires --reason\n", false
+	}
+	if a.act == actionReply && a.body == "" {
+		return a, "Error: --reply requires --body\n", false
+	}
+	if a.act == actionResolve && a.resolveTarget == "" {
+		return a, "Error: --resolve requires a comment ID\n", false
+	}
+	if a.act == actionBatchReply && a.batchFile == "" {
+		return a, "Error: --batch-reply requires a file path\n", false
+	}
+	if (a.act == actionBatchReject || a.act == actionBatchAcknowledge) && a.batchFile == "" {
+		return a, fmt.Sprintf("Error: --%s requires a file path\n", a.act), false
+	}
+	return a, "", false
+}
+
+// primaryActionFlag reports whether arg is a primary action flag and which
+// action it maps to. Aliases resolve to their canonical flag name for error
+// messages.
+func primaryActionFlag(arg string) (action, string, bool) {
+	switch arg {
+	case "--reject":
+		return actionReject, "--reject", true
+	case "--acknowledge", "--ack":
+		return actionAcknowledge, "--acknowledge", true
+	case "--reply":
+		return actionReply, "--reply", true
+	case "--batch-reply":
+		return actionBatchReply, "--batch-reply", true
+	case "--batch-reject":
+		return actionBatchReject, "--batch-reject", true
+	case "--batch-acknowledge", "--batch-ack":
+		return actionBatchAcknowledge, "--batch-acknowledge", true
+	case "--resolve":
+		return actionResolve, "--resolve", true
+	}
+	return "", "", false
+}
+
+// optionValue returns the value that must follow option flag at index i in
+// args. It errors when the value is missing at the end of args or when the
+// next token is flag-shaped, so a bare flag is never silently consumed as a
+// value.
+func optionValue(args []string, i int, flag string) (string, string) {
+	if i+1 >= len(args) {
+		return "", fmt.Sprintf("Error: %s requires a value\n", flag)
+	}
+	next := args[i+1]
+	if isFlagShaped(next) {
+		return "", fmt.Sprintf("Error: %s requires a value; %q looks like a flag\n", flag, next)
+	}
+	return next, ""
+}
+
+// isFlagShaped reports whether s would be parsed as a flag.
+func isFlagShaped(s string) bool {
+	return len(s) > 1 && strings.HasPrefix(s, "-")
+}
+
 func readBatchFile(path string, out interface{}) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -356,6 +390,9 @@ func main() {
 
 	// resolveComment performs one resolve request against the (possibly
 	// pre-fetched) comment list and returns the result appended by callers.
+	// Single-goroutine invariant: preFetched/preFetchErr are shared mutable
+	// state guarded only by this CLI invoking runResolve strictly sequentially
+	// on one goroutine; do not parallelize the batch loops without sync.
 	runResolve := func(rr resolveRequest) review.ReplyResult {
 		res := review.ReplyResult{CommentID: rr.commentID, Action: "resolve"}
 		if opts.dryRun {

@@ -8,7 +8,7 @@ Close the PR-review loop on GitHub or Forgejo with zero Go dependencies, for rev
 
 pr-review-tools provides two standalone Go binaries for AI agent workflows and developers who process PR reviews programmatically. The parser turns review comments into structured JSON or a consensus markdown summary; the reply tool posts custom per-comment replies or Mira-bot reject/acknowledge feedback, including batch operations, and resolves review threads on GitHub. The feedback loop is deterministic and does not require an LLM per interaction.
 
-The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. Both binaries are pure standard-library Go, so there are no external Go dependencies to download.
+The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. If it cannot determine who *you* are, the parser fails with an error rather than passing everything through unfiltered (opt out explicitly with `--include-self`). It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. Both binaries are pure standard-library Go, so there are no external Go dependencies to download.
 
 ## Table of Contents
 
@@ -89,6 +89,15 @@ bin/pr-review-parser 123 \
   --format consensus \
   --include-resolved \
   --authors nimuebot,human-reviewer
+```
+
+Because root comments from **any** reviewer are included by default, the parser applies a deterministic trust classification to the agent-instruction-bearing `agentPrompt` field: an author is trusted when its login ends in `bot` (case-insensitive, e.g. `miracodeai-bot`, `nimuebot`) or when it is listed in the repeatable-style CSV flag `--trusted-authors`. For untrusted authors `agentPrompt` is `null` and `isTrusted` is `false`, so a PR reviewer cannot inject agent instructions. Trusted authors' prompts are emitted as found; consensus output marks each row as trusted or untrusted.
+
+> **Warning:** the `bot` suffix rule matches on login string alone — a *human* reviewer whose login ends in `bot` (case-insensitive) is classified as trusted and has their `agentPrompt` emitted. There is no negative-override flag to un-trust such a login; the only escape is to avoid bot-suffixed human logins.
+
+```bash
+# Trust a human reviewer's agent prompts in addition to bot-suffixed logins.
+bin/pr-review-parser 123 --trusted-authors senior-reviewer,another-bot
 ```
 
 On follow-up passes after fixes were pushed, only see feedback newer than the last pushed state (any ONE of the three):
@@ -185,6 +194,7 @@ A parsed comment has this shape:
   "body": "...",
   "author": "reviewer-bot",
   "isMira": true,
+  "isTrusted": true,
   "suggestion": null,
   "agentPrompt": null,
   "diffHunk": null,
@@ -197,6 +207,8 @@ A parsed comment has this shape:
 ```
 
 `threadId` is the platform review-thread identifier (always `null` on Forgejo) and is what the reply tool uses to resolve threads. `isOutdated` marks threads whose diff position is stale (GitHub only today).
+
+`isTrusted` reports the deterministic trust classification of the author: `true` when the login ends in `bot` (case-insensitive) or appears in `--trusted-authors`. `agentPrompt` is only emitted for trusted authors — it is `null` for everyone else, even when their comment body contains an agent-prompt block. This keeps the any-author default from becoming an instruction-injection channel.
 
 The reply tool accepts `--format json` for reply results. Successful or failed results include the comment ID, action, generated body, and `success`; `error` and `replyUrl` are included when applicable. Resolve results appear as a second entry with `"action": "resolve"`.
 

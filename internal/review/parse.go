@@ -30,6 +30,28 @@ func IsMiraComment(author string) bool {
 	return false
 }
 
+// IsTrustedAuthor reports whether author is a trusted source of agent
+// instructions: its login ends in "bot" (case-insensitive — covers the
+// "-bot" and bare "bot" suffixes, e.g. miracodeai-bot, nimuebot), or it
+// appears in trustedAuthors (case-insensitive, exact match after trim).
+// An empty login is never trusted. This gates ParsedComment.AgentPrompt so
+// arbitrary PR reviewers cannot inject agent instructions.
+func IsTrustedAuthor(author string, trustedAuthors ...string) bool {
+	lower := strings.ToLower(author)
+	if lower == "" {
+		return false
+	}
+	if strings.HasSuffix(lower, "bot") {
+		return true
+	}
+	for _, a := range trustedAuthors {
+		if a = strings.TrimSpace(a); a != "" && strings.EqualFold(a, author) {
+			return true
+		}
+	}
+	return false
+}
+
 var reCategory = regexp.MustCompile(`^\*\*(.+?)\*\*`)
 
 // ParseCategory extracts the category from the first `**bold**` run of the
@@ -153,7 +175,21 @@ func FallbackID(id string) string {
 
 // ParseComment assembles a ParsedComment from a RawComment, deriving all
 // parsed fields from the body and applying path/line fallbacks.
+//
+// Trust: the AgentPrompt field carries agent instructions embedded in the
+// comment body. Because root comments from ANY author are included by
+// default, a prompt is only emitted when the author is trusted (bot-suffixed
+// login); otherwise AgentPrompt is nil and IsTrusted is false so consumers
+// can see why the prompt is absent.
 func ParseComment(comment RawComment) ParsedComment {
+	return ParseCommentTrusted(comment, nil)
+}
+
+// ParseCommentTrusted is ParseComment with an explicit trusted-authors list
+// (e.g. the --trusted-authors flag): an author is trusted when the login ends
+// in "bot" (case-insensitive) or appears in trustedAuthors. The AgentPrompt
+// is emitted only for trusted authors; IsTrusted records the classification.
+func ParseCommentTrusted(comment RawComment, trustedAuthors []string) ParsedComment {
 	file := "unknown"
 	if comment.Path != nil && *comment.Path != "" {
 		file = *comment.Path
@@ -171,6 +207,12 @@ func ParseComment(comment RawComment) ParsedComment {
 		lineEnd = *endLine
 	}
 
+	trusted := IsTrustedAuthor(comment.Author, trustedAuthors...)
+	agentPrompt := ParseAgentPrompt(comment.Body)
+	if !trusted {
+		agentPrompt = nil
+	}
+
 	return ParsedComment{
 		ID:            comment.ID,
 		File:          file,
@@ -181,9 +223,10 @@ func ParseComment(comment RawComment) ParsedComment {
 		Title:         ParseTitle(comment.Body),
 		Author:        comment.Author,
 		IsMira:        IsMiraComment(comment.Author),
+		IsTrusted:     trusted,
 		Body:          ParseBody(comment.Body),
 		Suggestion:    ParseSuggestion(comment.Body),
-		AgentPrompt:   ParseAgentPrompt(comment.Body),
+		AgentPrompt:   agentPrompt,
 		DiffHunk:      comment.DiffHunk,
 		IsResolved:    comment.IsResolved,
 		IsOutdated:    comment.IsOutdated,

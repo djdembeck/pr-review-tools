@@ -52,8 +52,9 @@ type ParsedComment struct {
 	Body          string   `json:"body"`
 	Author        string   `json:"author"`      // author login of the root comment
 	IsMira        bool     `json:"isMira"`      // true iff IsMiraComment(Author)
+	IsTrusted     bool     `json:"isTrusted"`   // true iff Author is a trusted prompt source (bot-suffix login or --trusted-authors entry)
 	Suggestion    *string  `json:"suggestion"`  // null when absent
-	AgentPrompt   *string  `json:"agentPrompt"` // null when absent
+	AgentPrompt   *string  `json:"agentPrompt"` // null when absent or author untrusted
 	DiffHunk      *string  `json:"diffHunk"`    // null when absent
 	IsResolved    bool     `json:"isResolved"`
 	IsOutdated    bool     `json:"isOutdated"`
@@ -100,9 +101,16 @@ type ghCommentNode struct {
 	ReplyTo           *ghReplyTo  `json:"replyTo"`
 }
 
+// ghPageInfo is the pagination metadata for a GraphQL connection.
+type ghPageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
 // ghComments wraps the GraphQL comments connection.
 type ghComments struct {
-	Nodes []ghCommentNode `json:"nodes"`
+	Nodes    []ghCommentNode `json:"nodes"`
+	PageInfo ghPageInfo      `json:"pageInfo"`
 }
 
 // ghThread is a single review thread.
@@ -115,7 +123,8 @@ type ghThread struct {
 
 // ghReviewThreads wraps the reviewThreads connection.
 type ghReviewThreads struct {
-	Nodes []ghThread `json:"nodes"`
+	Nodes    []ghThread `json:"nodes"`
+	PageInfo ghPageInfo `json:"pageInfo"`
 }
 
 // ghPullRequest is the pullRequest object.
