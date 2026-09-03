@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['*.md', 'docs/**']
   pull_request:
   workflow_dispatch:
 
@@ -17,7 +16,132 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      workflow: ${{ steps.classify.outputs.workflow }}
+      lint: ${{ steps.classify.outputs.lint }}
+      build: ${{ steps.classify.outputs.build }}
+      test: ${{ steps.classify.outputs.test }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        if: always()
+        run: |
+          set -uo pipefail
+
+          OUT="${GITHUB_OUTPUT}"
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          all_true() {
+            echo "workflow=true" >> "$OUT"
+            echo "lint=true" >> "$OUT"
+            echo "build=true" >> "$OUT"
+            echo "test=true" >> "$OUT"
+          }
+
+          EVENT="${{ github.event_name }}"
+          BASE=""
+          HEAD=""
+
+          case "$EVENT" in
+            pull_request)
+              BASE="${{ github.event.pull_request.base.sha }}"
+              HEAD="${{ github.event.pull_request.head.sha }}"
+              ;;
+            push)
+              BASE="${{ github.event.before }}"
+              HEAD="${{ github.sha }}"
+              if [ -z "$BASE" ] || [ "$BASE" = "$ZERO_SHA" ] || ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null 2>&1; then
+                echo "before SHA missing, zero, or unresolvable — enabling all concerns (fail-safe)"
+                all_true
+                exit 0
+              fi
+              ;;
+            *)
+              # workflow_dispatch (and any unrecognized event): no diff available
+              all_true
+              exit 0
+              ;;
+          esac
+
+          WORKFLOW=false
+          LINT=false
+          BUILD=false
+          TEST=false
+          SAW_PATH=0
+
+          while IFS= read -r -d '' path; do
+            SAW_PATH=1
+            case "$path" in
+              .github/workflows/*.yml|.github/workflows/*.yaml) WORKFLOW=true ;;
+              *_test.go) LINT=true; TEST=true ;;
+              *.go) LINT=true; BUILD=true; TEST=true ;;
+              go.mod|go.sum) LINT=true; BUILD=true; TEST=true ;;
+              .golangci.yml) LINT=true ;;
+              Makefile) BUILD=true ;;
+              *.md|docs/*|renovate.json5|.pre-commit-config.yaml|.gitignore|.editorconfig|LICENSE|.env.example|.github/*.md|CHANGELOG.md|.release-please-manifest.json|release-please-config.json) : ;;
+              *) LINT=true; BUILD=true; TEST=true ;;
+            esac
+          done < <(git diff --name-only -z --no-renames "$BASE" "$HEAD" 2>/dev/null)
+
+          if [ "$SAW_PATH" -eq 0 ]; then
+            echo "No diff paths (empty diff or classifier error) — enabling all concerns (fail-safe)"
+            WORKFLOW=true
+            LINT=true
+            BUILD=true
+            TEST=true
+          fi
+
+          echo "workflow=$WORKFLOW" >> "$OUT"
+          echo "lint=$LINT" >> "$OUT"
+          echo "build=$BUILD" >> "$OUT"
+          echo "test=$TEST" >> "$OUT"
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Change analysis"
+            echo
+            echo "| Concern | Changed | Job |"
+            echo "| --- | --- | --- |"
+            echo "| Workflow | ${{ steps.classify.outputs.workflow }} | \`workflow-lint\` |"
+            echo "| Lint | ${{ steps.classify.outputs.lint }} | \`lint-format\` |"
+            echo "| Build | ${{ steps.classify.outputs.build }} | \`build\` |"
+            echo "| Test | ${{ steps.classify.outputs.test }} | \`test\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workflow-lint:
+    name: Workflow Lint
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.workflow == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   lint-format:
+    name: Lint & Format
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -45,7 +169,9 @@ jobs:
         run: bash -c 'go mod tidy && git diff --exit-code -- go.mod go.sum'
 
   build:
-    needs: [lint-format]
+    name: Build
+    needs: [changes, workflow-lint, lint-format]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -62,7 +188,9 @@ jobs:
         run: make build
 
   test:
-    needs: [build]
+    name: Test
+    needs: [changes, workflow-lint, lint-format, build]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
