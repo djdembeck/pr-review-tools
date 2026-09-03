@@ -1,10 +1,11 @@
-package mira
+package review
 
 import (
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // GetGitRemote returns the trimmed "origin" remote URL of the current git
@@ -19,6 +20,35 @@ func GetGitRemote() (string, error) {
 		return "", fmt.Errorf("git remote get-url failed: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// GitCommitTime returns the commit timestamp (ISO 8601 / RFC3339) of the given
+// git ref.
+func GitCommitTime(ref string) (time.Time, error) {
+	out, err := exec.Command("git", "log", "-1", "--format=%cI", ref).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return time.Time{}, fmt.Errorf("git log for %q failed: %s", ref, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return time.Time{}, fmt.Errorf("git log for %q failed: %w", ref, err)
+	}
+	commitTime, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("could not parse commit time for %q: %w", ref, err)
+	}
+	return commitTime, nil
+}
+
+// ParseSinceArg resolves the --since flag value: either an RFC3339 timestamp
+// or a git ref whose commit time is used.
+func ParseSinceArg(s string) (time.Time, error) {
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, nil
+	}
+	if ts, err := GitCommitTime(s); err == nil {
+		return ts, nil
+	}
+	return time.Time{}, fmt.Errorf("invalid --since value %q: not an RFC3339 timestamp or a git ref", s)
 }
 
 // DetectPlatform returns the platform inferred from the remote URL. GitHub is

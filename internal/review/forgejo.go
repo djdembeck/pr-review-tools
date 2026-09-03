@@ -1,4 +1,4 @@
-package mira
+package review
 
 import (
 	"bytes"
@@ -134,7 +134,7 @@ func FetchForgejoComments(owner, repo string, prNumber int) ([]RawComment, error
 				DiffHunk:   diffHunk,
 				Author:     c.User.Login,
 				CreatedAt:  createdAt,
-				IsResolved: c.Resolved,
+				IsResolved: c.Resolver != nil,
 				IsOutdated: false,
 				ReplyToID:  replyToID,
 			})
@@ -278,4 +278,17 @@ func DetectForgejoBotName(owner, repo string, prNumber int) (string, error) {
 		}
 	}
 	return "miracodeai-bot", nil
+}
+
+// ResolveForgejoThread always fails: this Forgejo instance (Forgejo 16.0.3 /
+// gitea-1.22.0 API) exposes no conversation-resolve endpoint — resolution is
+// Enterprise-only. The failure is explicit so callers never mistake an
+// unresolved thread for a resolved one.
+func ResolveForgejoThread(owner, repo string, prNumber int, commentID string) ReplyResult {
+	return ReplyResult{
+		CommentID: commentID,
+		Action:    "resolve",
+		Success:   false,
+		Error:     "resolving review conversations is not supported by this Forgejo instance (no resolve API endpoint)",
+	}
 }

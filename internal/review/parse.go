@@ -1,8 +1,9 @@
-package mira
+package review
 
 import (
 	"regexp"
 	"strings"
+	"time"
 )
 
 // SeverityMap maps the leading emoji of a Mira comment's second line to a
@@ -150,9 +151,9 @@ func FallbackID(id string) string {
 	return id
 }
 
-// ParseMiraComment assembles a ParsedComment from a RawComment, deriving all
+// ParseComment assembles a ParsedComment from a RawComment, deriving all
 // parsed fields from the body and applying path/line fallbacks.
-func ParseMiraComment(comment RawComment) ParsedComment {
+func ParseComment(comment RawComment) ParsedComment {
 	file := "unknown"
 	if comment.Path != nil && *comment.Path != "" {
 		file = *comment.Path
@@ -185,19 +186,22 @@ func ParseMiraComment(comment RawComment) ParsedComment {
 		AgentPrompt:   ParseAgentPrompt(comment.Body),
 		DiffHunk:      comment.DiffHunk,
 		IsResolved:    comment.IsResolved,
+		IsOutdated:    comment.IsOutdated,
 		CreatedAt:     comment.CreatedAt,
+		ThreadID:      comment.ThreadID,
 		ThreadReplies: comment.ThreadReplies,
 	}
 }
 
-// FilterMiraRootComments keeps root comments (no reply parent) whose author is
-// a Mira bot or matches one of the additional author logins (case-insensitive
-// exact match).
-func FilterMiraRootComments(comments []RawComment, additionalAuthors ...string) []RawComment {
-	extra := make(map[string]struct{}, len(additionalAuthors))
-	for _, a := range additionalAuthors {
+// FilterRootComments keeps root comments (no reply parent). When authors is
+// empty, root comments from ANY author are kept. Otherwise, only root comments
+// whose author matches one of the listed logins (case-insensitive exact match)
+// are kept.
+func FilterRootComments(comments []RawComment, authors ...string) []RawComment {
+	allow := make(map[string]struct{}, len(authors))
+	for _, a := range authors {
 		if a = strings.TrimSpace(a); a != "" {
-			extra[strings.ToLower(a)] = struct{}{}
+			allow[strings.ToLower(a)] = struct{}{}
 		}
 	}
 	out := make([]RawComment, 0, len(comments))
@@ -205,8 +209,55 @@ func FilterMiraRootComments(comments []RawComment, additionalAuthors ...string) 
 		if c.ReplyToID != nil {
 			continue
 		}
-		_, isExtra := extra[strings.ToLower(c.Author)]
-		if IsMiraComment(c.Author) || isExtra {
+		if len(allow) == 0 {
+			out = append(out, c)
+			continue
+		}
+		if _, ok := allow[strings.ToLower(c.Author)]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// FilterOutAuthors drops comments whose author matches any of the given logins
+// (case-insensitive). An empty authors list is the identity function.
+func FilterOutAuthors(comments []RawComment, authors ...string) []RawComment {
+	deny := make(map[string]struct{}, len(authors))
+	for _, a := range authors {
+		if a = strings.TrimSpace(a); a != "" {
+			deny[strings.ToLower(a)] = struct{}{}
+		}
+	}
+	if len(deny) == 0 {
+		return comments
+	}
+	out := make([]RawComment, 0, len(comments))
+	for _, c := range comments {
+		if _, ok := deny[strings.ToLower(c.Author)]; ok {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// FilterSince keeps comments created strictly after since. Comments with a
+// missing or unparseable CreatedAt are KEPT (fail-open) so an undatable
+// comment is never silently hidden.
+func FilterSince(comments []RawComment, since time.Time) []RawComment {
+	out := make([]RawComment, 0, len(comments))
+	for _, c := range comments {
+		if c.CreatedAt == nil {
+			out = append(out, c)
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339, *c.CreatedAt)
+		if err != nil {
+			out = append(out, c)
+			continue
+		}
+		if ts.After(since) {
 			out = append(out, c)
 		}
 	}

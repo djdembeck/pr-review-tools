@@ -1,4 +1,4 @@
-package mira
+package review
 
 import (
 	"encoding/json"
@@ -135,6 +135,7 @@ func parseGitHubGraphQLResponse(raw string) ([]RawComment, error) {
 				threadReplies = replyCount
 			}
 
+			threadID := thread.ID
 			comments = append(comments, RawComment{
 				ID:            databaseID,
 				Body:          node.Body,
@@ -147,6 +148,7 @@ func parseGitHubGraphQLResponse(raw string) ([]RawComment, error) {
 				IsResolved:    thread.IsResolved,
 				IsOutdated:    thread.IsOutdated,
 				ReplyToID:     replyToID,
+				ThreadID:      &threadID,
 				ThreadReplies: threadReplies,
 			})
 		}
@@ -225,4 +227,66 @@ func DetectGitHubBotName(owner, repo string, prNumber int) (string, error) {
 		}
 	}
 	return "miracodeai-bot", nil
+}
+
+// GITHUB_RESOLVE_MUTATION resolves a single review thread by its GraphQL node
+// ID.
+const GITHUB_RESOLVE_MUTATION = `mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}`
+
+// FindThreadID returns the review-thread GraphQL node ID containing the given
+// comment ID (root or reply). Returns ok=false when no comment matches.
+func FindThreadID(comments []RawComment, commentID string) (string, bool) {
+	for _, c := range comments {
+		if c.ID == commentID && c.ThreadID != nil {
+			return *c.ThreadID, true
+		}
+	}
+	return "", false
+}
+
+// ResolveGitHubThread resolves the review thread containing threadID via the
+// gh CLI GraphQL endpoint. When dryRun is true, no API call is made. GraphQL
+// errors are reported as a failed ReplyResult with a nil error, mirroring
+// PostGitHubReply.
+func ResolveGitHubThread(owner, repo string, prNumber int, threadID string, dryRun bool) (ReplyResult, error) {
+	if dryRun {
+		return ReplyResult{Success: true}, nil
+	}
+	output, err := runGh([]string{
+		"api", "graphql",
+		"-f", "query=" + GITHUB_RESOLVE_MUTATION,
+		"-F", "threadId=" + threadID,
+	})
+	if err != nil {
+		return ReplyResult{Success: false, Error: err.Error()}, nil
+	}
+	var resp struct {
+		Data struct {
+			ResolveReviewThread struct {
+				Thread struct {
+					ID         string `json:"id"`
+					IsResolved bool   `json:"isResolved"`
+				} `json:"thread"`
+			} `json:"resolveReviewThread"`
+		} `json:"data"`
+		Errors []graphQLError `json:"errors"`
+	}
+	if jsonErr := json.Unmarshal([]byte(output), &resp); jsonErr != nil {
+		return ReplyResult{Success: false, Error: fmt.Sprintf("invalid GraphQL response: %v", jsonErr)}, nil
+	}
+	if len(resp.Errors) > 0 {
+		msg := resp.Errors[0].Message
+		if msg == "" {
+			msg = "unknown"
+		}
+		return ReplyResult{Success: false, Error: "GraphQL error: " + msg}, nil
+	}
+	if !resp.Data.ResolveReviewThread.Thread.IsResolved {
+		return ReplyResult{Success: false, Error: "resolve mutation returned isResolved=false"}, nil
+	}
+	return ReplyResult{Success: true}, nil
 }

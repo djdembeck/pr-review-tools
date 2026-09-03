@@ -1,3 +1,3 @@
-module github.com/djdembeck/mira-pr-tools
+module github.com/djdembeck/pr-review-tools
 
 go 1.24
