@@ -470,3 +470,108 @@ func TestInertPathTable(t *testing.T) {
 		}
 	})
 }
+
+// Regression test for the pre-commit-hook incident: the go-test hook ran
+// with GIT_DIR and friends set by the hook runner, and fixture git commands
+// that honored them resolved the host repository instead of the temp
+// fixture — rewriting the host index and polluting .git/config. gitEnv()
+// must strip every repository-selection and config-injection variable
+// while keeping the runtime environment (PATH, HOME) intact, and a child
+// launched with gitEnv() must target the fixture even when the process
+// environment is fully poisoned.
+func TestGitEnvStripsRepoSelectionVars(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	t.Run("strips selection vars, keeps runtime env", func(t *testing.T) {
+		t.Setenv("GIT_DIR", "/definitely/not/a/repo")
+		t.Setenv("GIT_INDEX_FILE", "/definitely/not/an/index")
+		t.Setenv("GIT_WORK_TREE", "/definitely/not/a/tree")
+		t.Setenv("GIT_CONFIG_GLOBAL", "/definitely/not/a/config")
+		t.Setenv("GIT_CONFIG_KEY_0", "user.name")
+		t.Setenv("GIT_CONFIG_VALUE_0", "evil")
+
+		kept := make(map[string]string)
+		for _, kv := range gitEnv() {
+			if key, value, ok := strings.Cut(kv, "="); ok {
+				kept[key] = value
+			}
+		}
+		for key, value := range kept {
+			switch {
+			case key == "GIT_DIR", key == "GIT_INDEX_FILE", key == "GIT_WORK_TREE":
+				t.Fatalf("gitEnv kept repo-selection var %s=%q", key, value)
+			case strings.HasPrefix(key, "GIT_CONFIG"):
+				t.Fatalf("gitEnv kept config-injection var %s=%q", key, value)
+			}
+		}
+		for _, key := range []string{"PATH", "HOME"} {
+			want, ok := os.LookupEnv(key)
+			if !ok {
+				continue
+			}
+			if got, ok := kept[key]; !ok {
+				t.Fatalf("gitEnv dropped %s; git would not be able to run", key)
+			} else if got != want {
+				t.Fatalf("gitEnv altered %s: got %q, want %q", key, got, want)
+			}
+		}
+	})
+
+	t.Run("child targets fixture despite poisoned env", func(t *testing.T) {
+		// Resolve the host repository's own selection variables WITHOUT
+		// gitEnv: if a hook runner has already leaked them, rev-parse
+		// reports exactly the leaked values, which is what we re-poison;
+		// otherwise cwd traversal finds the enclosing repository.
+		host := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Skipf("host git repo not resolvable (git %s: %v)\n%s", strings.Join(args, " "), err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		toplevel := host("rev-parse", "--show-toplevel")
+		gitDir := host("rev-parse", "--git-dir")
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(toplevel, gitDir)
+		}
+		gitDir, err := filepath.Abs(gitDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		index := host("rev-parse", "--git-path", "index")
+		if !filepath.IsAbs(index) {
+			index = filepath.Join(gitDir, index)
+		}
+		index, err = filepath.Abs(index)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		t.Setenv("GIT_DIR", gitDir)
+		t.Setenv("GIT_WORK_TREE", toplevel)
+		t.Setenv("GIT_INDEX_FILE", index)
+
+		dir, _ := gitRepo(t, "pr", nil)
+		cmd := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")
+		cmd.Env = gitEnv()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git rev-parse --show-toplevel in fixture: %v\n%s", err, out)
+		}
+		got, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("poisoned env leaked into child: fixture resolved to %q, want %q", got, want)
+		}
+	})
+}
