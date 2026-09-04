@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['*.md', 'docs/**']
   pull_request:
   workflow_dispatch:
 
@@ -17,7 +16,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      workflow: ${{ steps.classify.outputs.workflow }}
+      lint: ${{ steps.classify.outputs.lint }}
+      build: ${{ steps.classify.outputs.build }}
+      test: ${{ steps.classify.outputs.test }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        if: always()
+        env:
+          CLASSIFY_EVENT: ${{ github.event_name }}
+          CLASSIFY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CLASSIFY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/ci-changes.sh
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Change analysis"
+            echo
+            echo "| Concern | Changed | Job |"
+            echo "| --- | --- | --- |"
+            echo "| Workflow | ${{ steps.classify.outputs.workflow }} | \`workflow-lint\` |"
+            echo "| Lint | ${{ steps.classify.outputs.lint }} | \`lint-format\` |"
+            echo "| Build | ${{ steps.classify.outputs.build }} | \`build\` |"
+            echo "| Test | ${{ steps.classify.outputs.test }} | \`test\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workflow-lint:
+    name: Workflow Lint
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.workflow == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   lint-format:
+    name: Lint & Format
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -45,7 +104,9 @@ jobs:
         run: bash -c 'go mod tidy && git diff --exit-code -- go.mod go.sum'
 
   build:
-    needs: [lint-format]
+    name: Build
+    needs: [changes, workflow-lint, lint-format]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -62,7 +123,9 @@ jobs:
         run: make build
 
   test:
-    needs: [build]
+    name: Test
+    needs: [changes, workflow-lint, lint-format, build]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
