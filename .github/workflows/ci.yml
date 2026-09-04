@@ -34,76 +34,11 @@ jobs:
       - name: Classify changed files
         id: classify
         if: always()
-        run: |
-          set -uo pipefail
-
-          OUT="${GITHUB_OUTPUT}"
-          ZERO_SHA="0000000000000000000000000000000000000000"
-
-          all_true() {
-            echo "workflow=true" >> "$OUT"
-            echo "lint=true" >> "$OUT"
-            echo "build=true" >> "$OUT"
-            echo "test=true" >> "$OUT"
-          }
-
-          EVENT="${{ github.event_name }}"
-          BASE=""
-          HEAD=""
-
-          case "$EVENT" in
-            pull_request)
-              BASE="${{ github.event.pull_request.base.sha }}"
-              HEAD="${{ github.event.pull_request.head.sha }}"
-              ;;
-            push)
-              BASE="${{ github.event.before }}"
-              HEAD="${{ github.sha }}"
-              if [ -z "$BASE" ] || [ "$BASE" = "$ZERO_SHA" ] || ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null 2>&1; then
-                echo "before SHA missing, zero, or unresolvable — enabling all concerns (fail-safe)"
-                all_true
-                exit 0
-              fi
-              ;;
-            *)
-              # workflow_dispatch (and any unrecognized event): no diff available
-              all_true
-              exit 0
-              ;;
-          esac
-
-          WORKFLOW=false
-          LINT=false
-          BUILD=false
-          TEST=false
-          SAW_PATH=0
-
-          while IFS= read -r -d '' path; do
-            SAW_PATH=1
-            case "$path" in
-              .github/workflows/*.yml|.github/workflows/*.yaml) WORKFLOW=true ;;
-              *_test.go) LINT=true; TEST=true ;;
-              *.go) LINT=true; BUILD=true; TEST=true ;;
-              go.mod|go.sum) LINT=true; BUILD=true; TEST=true ;;
-              .golangci.yml) LINT=true ;;
-              Makefile) BUILD=true ;;
-              *.md|docs/*|renovate.json5|.pre-commit-config.yaml|.gitignore|.editorconfig|LICENSE|.env.example|.github/*.md|CHANGELOG.md|.release-please-manifest.json|release-please-config.json) : ;;
-              *) LINT=true; BUILD=true; TEST=true ;;
-            esac
-          done < <(git diff --name-only -z --no-renames "$BASE" "$HEAD" 2>/dev/null)
-
-          if [ "$SAW_PATH" -eq 0 ]; then
-            echo "No diff paths (empty diff or classifier error) — enabling all concerns (fail-safe)"
-            WORKFLOW=true
-            LINT=true
-            BUILD=true
-            TEST=true
-          fi
-
-          echo "workflow=$WORKFLOW" >> "$OUT"
-          echo "lint=$LINT" >> "$OUT"
-          echo "build=$BUILD" >> "$OUT"
-          echo "test=$TEST" >> "$OUT"
+        env:
+          CLASSIFY_EVENT: ${{ github.event_name }}
+          CLASSIFY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CLASSIFY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/ci-changes.sh
 
       - name: Summarize
         if: always()
