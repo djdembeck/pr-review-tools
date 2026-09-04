@@ -1,4 +1,4 @@
-package mira
+package review
 
 import (
 	"bytes"
@@ -74,8 +74,14 @@ func FormatConsensus(comments []ParsedComment) string {
 				bodyLines = bodyLines[:3]
 			}
 			quoted := strings.Join(bodyLines, "\n> ")
+			// Trust marker: untrusted authors have no agent prompt, so their
+			// findings must not be treated as agent instructions.
+			trust := "🤖 trusted"
+			if !c.IsTrusted {
+				trust = "untrusted (no agent prompt)"
+			}
 			lines = append(lines,
-				fmt.Sprintf("> **%s** | %s | %s", c.Category, strings.ToUpper(string(c.Severity)), status),
+				fmt.Sprintf("> **%s** | %s | %s | %s", c.Category, strings.ToUpper(string(c.Severity)), status, trust),
 				">",
 				"> "+quoted,
 				"",

@@ -1,4 +1,4 @@
-package mira
+package review
 
 import "encoding/json"
 
@@ -34,6 +34,7 @@ type RawComment struct {
 	IsResolved    bool    `json:"isResolved"`
 	IsOutdated    bool    `json:"isOutdated"`
 	ReplyToID     *string `json:"replyToId"` // null = root comment
+	ThreadID      *string `json:"threadId"`  // null = not a threaded platform (e.g. Forgejo)
 	ThreadReplies int     `json:"threadReplies"`
 }
 
@@ -51,11 +52,14 @@ type ParsedComment struct {
 	Body          string   `json:"body"`
 	Author        string   `json:"author"`      // author login of the root comment
 	IsMira        bool     `json:"isMira"`      // true iff IsMiraComment(Author)
+	IsTrusted     bool     `json:"isTrusted"`   // true iff Author is a trusted prompt source (exact --trusted-authors entry)
 	Suggestion    *string  `json:"suggestion"`  // null when absent
-	AgentPrompt   *string  `json:"agentPrompt"` // null when absent
+	AgentPrompt   *string  `json:"agentPrompt"` // null when absent or author untrusted
 	DiffHunk      *string  `json:"diffHunk"`    // null when absent
 	IsResolved    bool     `json:"isResolved"`
+	IsOutdated    bool     `json:"isOutdated"`
 	CreatedAt     *string  `json:"createdAt"` // null when absent
+	ThreadID      *string  `json:"threadId"`  // null when absent (non-threaded platform)
 	ThreadReplies int      `json:"threadReplies"`
 }
 
@@ -97,9 +101,16 @@ type ghCommentNode struct {
 	ReplyTo           *ghReplyTo  `json:"replyTo"`
 }
 
+// ghPageInfo is the pagination metadata for a GraphQL connection.
+type ghPageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
 // ghComments wraps the GraphQL comments connection.
 type ghComments struct {
-	Nodes []ghCommentNode `json:"nodes"`
+	Nodes    []ghCommentNode `json:"nodes"`
+	PageInfo ghPageInfo      `json:"pageInfo"`
 }
 
 // ghThread is a single review thread.
@@ -112,7 +123,8 @@ type ghThread struct {
 
 // ghReviewThreads wraps the reviewThreads connection.
 type ghReviewThreads struct {
-	Nodes []ghThread `json:"nodes"`
+	Nodes    []ghThread `json:"nodes"`
+	PageInfo ghPageInfo `json:"pageInfo"`
 }
 
 // ghPullRequest is the pullRequest object.
@@ -150,19 +162,19 @@ type forgejoUser struct {
 
 // forgejoComment is a single Forgejo review comment.
 type forgejoComment struct {
-	ID               json.Number `json:"id"`
-	Body             string      `json:"body"`
-	User             forgejoUser `json:"user"`
-	DiffHunk         *string     `json:"diff_hunk"`
-	Diff             *string     `json:"diff"`
-	InReplyToID      *int64      `json:"in_reply_to_id"`
-	Path             *string     `json:"path"`
-	Line             *int        `json:"line"`
-	StartLine        *int        `json:"start_line"`
-	Position         int         `json:"position"`          // new-file line (LineNum); 0 if none
-	OriginalPosition int         `json:"original_position"` // old-file line (OldLineNum); 0 if none
-	CreatedAt        *string     `json:"created_at"`
-	Resolved         bool        `json:"resolved"`
+	ID               json.Number  `json:"id"`
+	Body             string       `json:"body"`
+	User             forgejoUser  `json:"user"`
+	DiffHunk         *string      `json:"diff_hunk"`
+	Diff             *string      `json:"diff"`
+	InReplyToID      *int64       `json:"in_reply_to_id"`
+	Path             *string      `json:"path"`
+	Line             *int         `json:"line"`
+	StartLine        *int         `json:"start_line"`
+	Position         int          `json:"position"`          // new-file line (LineNum); 0 if none
+	OriginalPosition int          `json:"original_position"` // old-file line (OldLineNum); 0 if none
+	CreatedAt        *string      `json:"created_at"`
+	Resolver         *forgejoUser `json:"resolver"` // non-null = conversation resolved
 }
 
 // forgejoReview is a single Forgejo review (holds an id + author).
