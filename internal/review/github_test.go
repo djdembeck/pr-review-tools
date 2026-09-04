@@ -3,6 +3,7 @@ package review
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -195,6 +196,7 @@ func TestFetchGitHubCommentsPagination(t *testing.T) {
 	)
 	seenThreads := 0
 	seenComments := map[string]int{}
+	var commentPageArgs []string
 	pageInfoStop := `{"hasNextPage":false,"endCursor":null}`
 
 	setGhRunEnv(t, func(args []string) (string, error) {
@@ -240,6 +242,7 @@ func TestFetchGitHubCommentsPagination(t *testing.T) {
 			threadID, _ := ghField(args, "threadId")
 			after, _ := ghField(args, "after")
 			seenComments[threadID]++
+			commentPageArgs = append([]string(nil), args...)
 			if threadID != bigThread {
 				return "", fmt.Errorf("unexpected thread %q", threadID)
 			}
@@ -271,6 +274,27 @@ func TestFetchGitHubCommentsPagination(t *testing.T) {
 	}
 	if n := seenComments[bigThread]; n != 1 {
 		t.Fatalf("expected 1 additional comment page fetch for %s, got %d", bigThread, n)
+	}
+
+	// (1a) The thread-comments page request carries exactly the threadId and
+	// after variables (plus the query): no owner/repo/pr -F variables, which
+	// the GITHUB_THREAD_COMMENTS_QUERY node(id:) shape does not declare.
+	for i, a := range commentPageArgs {
+		if a != "-F" && a != "-f" || i+1 >= len(commentPageArgs) {
+			continue
+		}
+		val := commentPageArgs[i+1]
+		for _, banned := range []string{"owner=", "repo=", "pr="} {
+			if strings.HasPrefix(val, banned) {
+				t.Fatalf("thread-comments page request carries -F %s arg", val)
+			}
+		}
+	}
+	for _, want := range []string{"threadId", "after"} {
+		if _, ok := ghField(commentPageArgs, want); !ok {
+			t.Errorf("thread-comments page request missing -F %s=%s: %v", want,
+				map[string]string{"threadId": bigThread, "after": "cursor-50"}[want], commentPageArgs)
+		}
 	}
 
 	// Every thread and every comment was accumulated: 99 + 20 single-comment
@@ -594,6 +618,48 @@ func TestParseSinceArgInvalid(t *testing.T) {
 	_, err := ParseSinceArg("this-ref-does-not-exist-9f3b2a")
 	if err == nil || !strings.Contains(err.Error(), `invalid --since value`) {
 		t.Fatalf("want invalid --since error, got %v", err)
+	}
+}
+
+var gqlVarListRe = regexp.MustCompile(`^(?:query|mutation)(?:\w+)?\s*\(([^)]*)\)`)
+var gqlVarRe = regexp.MustCompile(`\$(\w+)`)
+
+// TestGraphQLQueriesDeclareOnlyUsedVariables verifies the invariant that every
+// variable declared in a query's variable list is used in its body, for all
+// exported GraphQL operations in this file. GitHub rejects requests that
+// declare unused variables ("variable $x is never used"), so any regression
+// in a query's variable list fails this test before it reaches the API.
+func TestGraphQLQueriesDeclareOnlyUsedVariables(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "GITHUB_GRAPHQL", query: GITHUB_GRAPHQL},
+		{name: "GITHUB_THREAD_COMMENTS_QUERY", query: GITHUB_THREAD_COMMENTS_QUERY},
+		{name: "GITHUB_RESOLVE_MUTATION", query: GITHUB_RESOLVE_MUTATION},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := gqlVarListRe.FindStringSubmatch(tt.query)
+			if m == nil {
+				t.Fatalf("%s: no variable list found", tt.name)
+			}
+			varList := m[1]
+			declared := gqlVarRe.FindAllStringSubmatch(varList, -1)
+			if len(declared) == 0 {
+				t.Fatalf("%s: no variables declared", tt.name)
+			}
+			body := strings.Replace(tt.query, "("+varList+")", "", 1)
+			used := map[string]bool{}
+			for _, u := range gqlVarRe.FindAllStringSubmatch(body, -1) {
+				used[u[1]] = true
+			}
+			for _, d := range declared {
+				if !used[d[1]] {
+					t.Errorf("%s declares variable $%s but never uses it", tt.name, d[1])
+				}
+			}
+		})
 	}
 }
 

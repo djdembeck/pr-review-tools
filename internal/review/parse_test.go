@@ -149,24 +149,27 @@ func TestFilterSince(t *testing.T) {
 }
 
 // TestIsTrustedAuthor verifies the deterministic trust classification:
-// bot-suffixed logins are trusted (case-insensitive), --trusted-authors
-// entries are trusted (case-insensitive, trimmed), and plain human logins
-// are not.
+// only exact, case-insensitive (after trim) matches against the
+// --trusted-authors list are trusted. There is no suffix-based trust — a
+// bot-suffixed login NOT in the list is untrusted — and no hardcoded
+// allowlist.
 func TestIsTrustedAuthor(t *testing.T) {
 	cases := []struct {
 		author  string
 		extra   []string
 		trusted bool
 	}{
-		{"miracodeai-bot", nil, true},
-		{"nimuebot", nil, true},
-		{"NIMUEBOT", nil, true},
-		{"some-thing-bot", nil, true},
-		{"robot", nil, true},
+		{"miracodeai-bot", nil, false}, // bot-suffixed but not listed
+		{"nimuebot", nil, false},       // bot-suffixed but not listed
+		{"NIMUEBOT", nil, false},       // bot-suffixed but not listed
+		{"some-thing-bot", nil, false}, // bot-suffixed but not listed
+		{"robot", nil, false},          // bot-suffixed but not listed
 		{"human-reviewer", nil, false},
-		{"copilot", nil, false}, // not bot-suffixed; trusted only via the list
+		{"copilot", nil, false},
 		{"copilot", []string{"copilot"}, true},
 		{"Copilot", []string{" Copilot "}, true},
+		{"NIMUEBOT", []string{"nimuebot"}, true}, // case-insensitive list match
+		{"nimuebot", []string{"nimuebot"}, true},
 		{"mira", []string{"Mira"}, true},
 		{"mira", []string{"nimuebot"}, false},
 		{"", nil, false},
@@ -195,9 +198,10 @@ const agentPromptBody = "**Bug**\n" +
 	"</details>"
 
 // TestParseCommentAgentPromptTrustGating verifies the trust boundary: an
-// embedded agent prompt is emitted only for trusted authors (bot-suffixed
-// logins by default, --trusted-authors entries when listed). Untrusted
-// authors must get a nil AgentPrompt even when their body contains a prompt.
+// embedded agent prompt is emitted only for authors whose login is an exact,
+// case-insensitive match against a --trusted-authors entry. With no list,
+// nobody is trusted. Untrusted authors must get a nil AgentPrompt even when
+// their body contains a prompt.
 func TestParseCommentAgentPromptTrustGating(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -206,12 +210,13 @@ func TestParseCommentAgentPromptTrustGating(t *testing.T) {
 		wantTrusted    bool
 		wantPrompt     bool
 	}{
-		{"bot author default", "nimuebot", nil, true, true},
-		{"bot author case-insensitive", "MiracodeAI-BOT", nil, true, true},
+		{"bot-suffixed author without list", "nimuebot", nil, false, false},
+		{"bot-suffixed author case without list", "MiracodeAI-BOT", nil, false, false},
 		{"human author default", "human-reviewer", nil, false, false},
+		{"bot-suffixed author via trusted list", "nimuebot", []string{"nimuebot"}, true, true},
+		{"bot-suffixed author case-insensitive list match", "MiracodeAI-BOT", []string{"miracodeai-bot"}, true, true},
 		{"human author via trusted list", "human-reviewer", []string{"human-reviewer"}, true, true},
 		{"unlisted author with trusted list", "copilot", []string{"nimuebot"}, false, false},
-		{"bot author with trusted list", "nimuebot", []string{"copilot"}, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,15 +236,16 @@ func TestParseCommentAgentPromptTrustGating(t *testing.T) {
 }
 
 // TestParseCommentPromptAbsent verifies a trusted author without a prompt
-// block still gets a nil AgentPrompt, and the plain ParseComment wrapper
-// (no trusted-authors list) is equivalent to ParseCommentTrusted with nil.
+// block still gets a nil AgentPrompt (no prompt block → nil prompt
+// regardless of trust), and the plain ParseComment wrapper (no trusted-
+// authors list) is equivalent to ParseCommentTrusted with nil.
 func TestParseCommentPromptAbsent(t *testing.T) {
-	got := ParseComment(RawComment{ID: "1", Author: "nimuebot", Body: "**Bug**\n🛑\n"})
+	got := ParseCommentTrusted(RawComment{ID: "1", Author: "nimuebot", Body: "**Bug**\n🛑\n"}, []string{"nimuebot"})
 	if got.AgentPrompt != nil {
 		t.Fatal("trusted author without a prompt block must have nil AgentPrompt")
 	}
 	if !got.IsTrusted {
-		t.Fatal("nimuebot must be trusted")
+		t.Fatal("listed nimuebot must be trusted")
 	}
 
 	wrapper := ParseComment(RawComment{ID: "2", Author: "human-reviewer", Body: agentPromptBody})
@@ -248,7 +254,7 @@ func TestParseCommentPromptAbsent(t *testing.T) {
 		t.Fatal("ParseComment must be equivalent to ParseCommentTrusted with a nil list")
 	}
 	if wrapper.AgentPrompt != nil || wrapper.IsTrusted {
-		t.Fatal("human author via wrapper must be untrusted with nil prompt")
+		t.Fatal("unlisted author via wrapper must be untrusted with nil prompt")
 	}
 }
 

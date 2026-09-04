@@ -91,13 +91,13 @@ bin/pr-review-parser 123 \
   --authors nimuebot,human-reviewer
 ```
 
-Because root comments from **any** reviewer are included by default, the parser applies a deterministic trust classification to the agent-instruction-bearing `agentPrompt` field: an author is trusted when its login ends in `bot` (case-insensitive, e.g. `miracodeai-bot`, `nimuebot`) or when it is listed in the repeatable-style CSV flag `--trusted-authors`. For untrusted authors `agentPrompt` is `null` and `isTrusted` is `false`, so a PR reviewer cannot inject agent instructions. Trusted authors' prompts are emitted as found; consensus output marks each row as trusted or untrusted.
+Because root comments from **any** reviewer are included by default, the parser applies a deterministic trust classification to the agent-instruction-bearing `agentPrompt` field: an author is trusted **only** when its login is an exact, case-insensitive match (after trim) against an entry in the `--trusted-authors` CSV flag. There is no bot-suffix rule and no hardcoded allowlist. For untrusted authors `agentPrompt` is `null` and `isTrusted` is `false`, so a PR reviewer cannot inject agent instructions. Trusted authors' prompts are emitted as found; consensus output marks each row as trusted or untrusted.
 
-> **Warning:** the `bot` suffix rule matches on login string alone — a *human* reviewer whose login ends in `bot` (case-insensitive) is classified as trusted and has their `agentPrompt` emitted. There is no negative-override flag to un-trust such a login; the only escape is to avoid bot-suffixed human logins.
+> **Behavior change:** unlike the previous release, logins such as `miracodeai-bot` or `nimuebot` are **NOT** trusted by default — the old rule that trusted any login ending in `bot` has been removed. You MUST pass your review bot's exact login via `--trusted-authors` to receive its agent prompts; forgetting the flag suppresses all `agentPrompt` output (comments still appear, with `isTrusted: false`).
 
 ```bash
-# Trust a human reviewer's agent prompts in addition to bot-suffixed logins.
-bin/pr-review-parser 123 --trusted-authors senior-reviewer,another-bot
+# Trust your review bot's exact login so its agent prompts are emitted.
+bin/pr-review-parser 123 --trusted-authors miracodeai-bot
 ```
 
 On follow-up passes after fixes were pushed, only see feedback newer than the last pushed state (any ONE of the three):
@@ -192,7 +192,7 @@ A parsed comment has this shape:
   "severity": "blocker",
   "title": "Missing null check",
   "body": "...",
-  "author": "reviewer-bot",
+  "author": "miracodeai-bot",
   "isMira": true,
   "isTrusted": true,
   "suggestion": null,
@@ -206,9 +206,11 @@ A parsed comment has this shape:
 }
 ```
 
+In this example `isTrusted` is `true` because the parser was run with `--trusted-authors miracodeai-bot`; without the flag, `isTrusted` is `false` for every author.
+
 `threadId` is the platform review-thread identifier (always `null` on Forgejo) and is what the reply tool uses to resolve threads. `isOutdated` marks threads whose diff position is stale (GitHub only today).
 
-`isTrusted` reports the deterministic trust classification of the author: `true` when the login ends in `bot` (case-insensitive) or appears in `--trusted-authors`. `agentPrompt` is only emitted for trusted authors — it is `null` for everyone else, even when their comment body contains an agent-prompt block. This keeps the any-author default from becoming an instruction-injection channel.
+`isTrusted` reports the deterministic trust classification of the author: `true` only when the login is an exact, case-insensitive match (after trim) against an entry in `--trusted-authors` — there is no bot-suffix rule and no hardcoded allowlist. `agentPrompt` is only emitted for trusted authors — it is `null` for everyone else, even when their comment body contains an agent-prompt block. This keeps the any-author default from becoming an instruction-injection channel.
 
 The reply tool accepts `--format json` for reply results. Successful or failed results include the comment ID, action, generated body, and `success`; `error` and `replyUrl` are included when applicable. Resolve results appear as a second entry with `"action": "resolve"`.
 

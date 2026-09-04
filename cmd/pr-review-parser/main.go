@@ -31,8 +31,8 @@ Flags:
   --format json|consensus   Output format (default: json)
   --include-resolved        Include resolved threads (default: exclude)
   --authors <csv>           Only include root comments from these logins (default: all reviewers)
-  --trusted-authors <csv>   Additional trusted author logins (agent prompts are only emitted for trusted authors: bot-suffixed logins or these entries).
-                            Warning: ANY login ending in 'bot' (case-insensitive) is trusted automatically — a human reviewer with such a login has their agent prompts emitted, and there is no flag to un-trust them.
+  --trusted-authors <csv>   Trusted author logins (agent prompts are ONLY emitted for these exact logins, matched case-insensitively after trim; there is no suffix-based or hardcoded trust).
+                            Pass your review bot's exact login (e.g. miracodeai-bot) to receive its agent prompts — without it, NO author's agent prompts are emitted.
   --include-self            Include comments authored by the authenticated user (default: exclude)
   --include-outdated        Include outdated threads (default: exclude)
   --since <ref|RFC3339>     Only comments created after this git ref's commit time or timestamp

@@ -31,18 +31,16 @@ func IsMiraComment(author string) bool {
 }
 
 // IsTrustedAuthor reports whether author is a trusted source of agent
-// instructions: its login ends in "bot" (case-insensitive — covers the
-// "-bot" and bare "bot" suffixes, e.g. miracodeai-bot, nimuebot), or it
-// appears in trustedAuthors (case-insensitive, exact match after trim).
-// An empty login is never trusted. This gates ParsedComment.AgentPrompt so
-// arbitrary PR reviewers cannot inject agent instructions.
+// instructions: the login must be an exact, case-insensitive match (after
+// trim) against one of the trustedAuthors entries. There is no suffix-based
+// trust (a login ending in "bot" is NOT trusted) and no hardcoded
+// allowlist — consumers must pass their review bot's exact login. An empty
+// login is never trusted. This gates ParsedComment.AgentPrompt so arbitrary
+// PR reviewers cannot inject agent instructions.
 func IsTrustedAuthor(author string, trustedAuthors ...string) bool {
 	lower := strings.ToLower(author)
 	if lower == "" {
 		return false
-	}
-	if strings.HasSuffix(lower, "bot") {
-		return true
 	}
 	for _, a := range trustedAuthors {
 		if a = strings.TrimSpace(a); a != "" && strings.EqualFold(a, author) {
@@ -178,17 +176,19 @@ func FallbackID(id string) string {
 //
 // Trust: the AgentPrompt field carries agent instructions embedded in the
 // comment body. Because root comments from ANY author are included by
-// default, a prompt is only emitted when the author is trusted (bot-suffixed
-// login); otherwise AgentPrompt is nil and IsTrusted is false so consumers
-// can see why the prompt is absent.
+// default, a prompt is only emitted when the author is trusted (exact
+// case-insensitive match against a trusted-authors entry — with no list
+// passed, nobody is trusted); otherwise AgentPrompt is nil and IsTrusted is
+// false so consumers can see why the prompt is absent.
 func ParseComment(comment RawComment) ParsedComment {
 	return ParseCommentTrusted(comment, nil)
 }
 
 // ParseCommentTrusted is ParseComment with an explicit trusted-authors list
-// (e.g. the --trusted-authors flag): an author is trusted when the login ends
-// in "bot" (case-insensitive) or appears in trustedAuthors. The AgentPrompt
-// is emitted only for trusted authors; IsTrusted records the classification.
+// (e.g. the --trusted-authors flag): an author is trusted only when its login
+// is an exact, case-insensitive match (after trim) against a list entry —
+// there is no suffix-based trust. The AgentPrompt is emitted only for
+// trusted authors; IsTrusted records the classification.
 func ParseCommentTrusted(comment RawComment, trustedAuthors []string) ParsedComment {
 	file := "unknown"
 	if comment.Path != nil && *comment.Path != "" {

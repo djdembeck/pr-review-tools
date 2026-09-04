@@ -254,6 +254,12 @@ func TestFlagParseAuthorsSubprocess(t *testing.T) {
 			wantInOutput: "Error: --authors requires a non-empty value",
 		},
 		{
+			name:         "trusted-authors flag-shaped value rejected",
+			args:         []string{"42", "--trusted-authors", "--include-self"},
+			wantCode:     1,
+			wantInOutput: "trusted-authors got flag-shaped value '--include-self', expected CSV of logins",
+		},
+		{
 			name:         "trusted-authors empty CSV requires non-empty value",
 			args:         []string{"42", "--trusted-authors", ""},
 			wantCode:     1,

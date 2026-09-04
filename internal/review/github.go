@@ -46,7 +46,7 @@ const GITHUB_GRAPHQL = `query($owner: String!, $repo: String!, $pr: Int!, $after
 // 50 comments. It resolves the thread through the generic node(id:) interface
 // because PullRequest has no singular reviewThread field (only reviewThreads),
 // so repository.pullRequest.reviewThread is not a valid GraphQL path.
-const GITHUB_THREAD_COMMENTS_QUERY = `query($owner: String!, $repo: String!, $pr: Int!, $threadId: ID!, $after: String) {
+const GITHUB_THREAD_COMMENTS_QUERY = `query($threadId: ID!, $after: String) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {
       comments(first: 50, after: $after) {
@@ -142,9 +142,6 @@ func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error)
 			args := []string{
 				"api", "graphql",
 				"-F", "query=" + GITHUB_THREAD_COMMENTS_QUERY,
-				"-F", "owner=" + owner,
-				"-F", "repo=" + repo,
-				"-F", fmt.Sprintf("pr=%d", prNumber),
 				"-F", "threadId=" + threads[i].ID,
 				"-F", "after=" + pageInfo.EndCursor,
 			}

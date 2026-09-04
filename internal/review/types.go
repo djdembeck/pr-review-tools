@@ -52,7 +52,7 @@ type ParsedComment struct {
 	Body          string   `json:"body"`
 	Author        string   `json:"author"`      // author login of the root comment
 	IsMira        bool     `json:"isMira"`      // true iff IsMiraComment(Author)
-	IsTrusted     bool     `json:"isTrusted"`   // true iff Author is a trusted prompt source (bot-suffix login or --trusted-authors entry)
+	IsTrusted     bool     `json:"isTrusted"`   // true iff Author is a trusted prompt source (exact --trusted-authors entry)
 	Suggestion    *string  `json:"suggestion"`  // null when absent
 	AgentPrompt   *string  `json:"agentPrompt"` // null when absent or author untrusted
 	DiffHunk      *string  `json:"diffHunk"`    // null when absent
