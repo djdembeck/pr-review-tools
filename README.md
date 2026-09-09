@@ -150,7 +150,9 @@ Mira-bot templates (for `isMira: true` comments) still work exactly as before �
 # Reject a false positive with the Mira learning-loop signal.
 bin/pr-review-reply 123 --reject 3564917980 --reason "Auth at middleware layer"
 
-# Acknowledge a valid finding and record the fixing commit.
+# Acknowledge a valid finding and record the fixing commit. The tool posts a
+# static template ("Acknowledged — valid finding. …"); --note appends short
+# extra context after it — do not pass an acknowledgment sentence as the note.
 bin/pr-review-reply 123 --acknowledge 3564917980 --commit abc123 --note "Covered by middleware tests"
 
 # Let the tool find the active Mira bot from existing PR comments.
