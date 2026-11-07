@@ -25,7 +25,7 @@ The default relevance contract for the parser: **root comments that are open, no
 
 Reviewers post comments on PRs — automation bots like [Mira](https://github.com/mira-reviewer/mira) or `nimuebot`, and human reviewers — but there is no programmatic way for AI agent workflows (like `/fixup`) to see only the feedback that still matters and communicate back which findings were addressed and which were dismissed. This repo closes that loop: the parser extracts the relevant comments (filtering out resolved, outdated, and your own replies), and the reply tool posts a short custom note per comment and resolves the thread so it stays closed. Mira-authored comments additionally support the `@bot-name reject — <reason>` / acknowledge templates that feed Mira's learning loop.
 
-The two-binary design separates parsing from acting: `pr-review-parser` extracts review data, and `pr-review-reply` posts the feedback. Together they provide a parse-then-act pipeline for teams that need to process many findings without replying manually to every comment.
+The design separates parsing, acting, and waiting: `pr-review-parser` extracts review data, `pr-review-reply` posts the feedback, and `pr-review-watch` blocks until a reviewer posts new comments. Together they provide a parse-then-act pipeline for teams that need to process many findings without replying manually to every comment.
 
 ## Install / Running
 
@@ -71,7 +71,7 @@ go install github.com/djdembeck/pr-review-tools/cmd/pr-review-reply@v1.0.0
 
 ## Usage
 
-The examples below use the binaries produced by `make build`. If you used `go install`, invoke `pr-review-parser` and `pr-review-reply` without the `bin/` prefix. Run the commands from a checkout of the PR repository so the tools can inspect `git remote get-url origin`.
+The examples below use the binaries produced by `make build`. If you used `go install`, invoke `pr-review-parser`, `pr-review-reply`, and `pr-review-watch` without the `bin/` prefix. Run the commands from a checkout of the PR repository so the tools can inspect `git remote get-url origin`.
 
 ### Parsing
 
