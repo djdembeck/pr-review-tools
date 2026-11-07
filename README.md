@@ -6,9 +6,9 @@
 
 Close the PR-review loop on GitHub or Forgejo with zero Go dependencies, for reviews from ANY reviewer — bots or humans.
 
-pr-review-tools provides two standalone Go binaries for AI agent workflows and developers who process PR reviews programmatically. The parser turns review comments into structured JSON or a consensus markdown summary; the reply tool posts custom per-comment replies or Mira-bot reject/acknowledge feedback, including batch operations, and resolves review threads on GitHub. The feedback loop is deterministic and does not require an LLM per interaction.
+pr-review-tools provides three standalone Go binaries for AI agent workflows and developers who process PR reviews programmatically. The parser turns review comments into structured JSON or a consensus markdown summary; the reply tool posts custom per-comment replies or Mira-bot reject/acknowledge feedback, including batch operations, and resolves review threads on GitHub; the watch tool persistently polls a PR and exits as soon as a new review comment appears, so agent workflows can block on reviewers instead of polling manually. The feedback loop is deterministic and does not require an LLM per interaction.
 
-The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. If it cannot determine who *you* are, the parser fails with an error rather than passing everything through unfiltered (opt out explicitly with `--include-self`). It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. Both binaries are pure standard-library Go, so there are no external Go dependencies to download.
+The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. If it cannot determine who *you* are, the parser fails with an error rather than passing everything through unfiltered (opt out explicitly with `--include-self`). It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. All binaries are pure standard-library Go, so there are no external Go dependencies to download.
 
 ## Table of Contents
 
@@ -45,13 +45,14 @@ From the repository root:
 make build
 ```
 
-This creates `bin/pr-review-parser` and `bin/pr-review-reply`. Set the credentials for the platform selected by the current repository's remote before running either binary.
+This creates `bin/pr-review-parser`, `bin/pr-review-reply`, and `bin/pr-review-watch`. Set the credentials for the platform selected by the current repository's remote before running any binary.
 
 If you prefer Go's module install path, it also compiles the commands locally and places them in `$GOPATH/bin` (normally `~/go/bin`):
 
 ```bash
 go install github.com/djdembeck/pr-review-tools/cmd/pr-review-parser@latest
 go install github.com/djdembeck/pr-review-tools/cmd/pr-review-reply@latest
+go install github.com/djdembeck/pr-review-tools/cmd/pr-review-watch@latest
 ```
 
 Make sure `$GOPATH/bin` is on your `$PATH`. Re-run those commands to update; there is no automatic update mechanism. See [GitHub Releases](https://github.com/djdembeck/pr-review-tools/releases) for changelogs.
@@ -107,6 +108,19 @@ bin/pr-review-parser 123 --since-last-push     # comments after the upstream tra
 bin/pr-review-parser 123 --since-last-commit   # comments after HEAD
 bin/pr-review-parser 123 --since abc123        # comments after any git ref, or an RFC3339 timestamp
 ```
+
+### Watching
+
+Block until a reviewer posts: the watch tool persistently polls the PR and exits as soon as a **new** review comment appears.
+
+```bash
+bin/pr-review-watch 123                 # default: 15m timeout, 30s poll, all reviewers
+bin/pr-review-watch 123 --timeout 5m --poll 10s --authors miracodeai-bot,nimuebot
+```
+
+Exit codes: `0` = new review comment found (emitted as JSON, or consensus markdown with `--format consensus`, on stdout); `1` = usage/setup/fetch error; `2` = timed out.
+
+Baseline semantics: the first fetch captures the currently relevant comments (open, not outdated, non-self root comments — the same contract as the parser), keyed by comment ID. Only comments that appear **after** the watch starts count; pre-existing comments do not trigger success. New root comments trigger; a reply inside an existing thread does not. Transient poll errors (e.g. a network blip) are logged to stderr and the watch keeps polling until the deadline; a baseline fetch failure is fatal.
 
 ### Replied to every reviewer
 
@@ -218,7 +232,7 @@ The reply tool accepts `--format json` for reply results. Successful or failed r
 
 ## Building
 
-`make build` builds both commands:
+`make build` builds all three commands:
 
 ```bash
 make build
@@ -229,6 +243,7 @@ The equivalent direct commands are:
 ```bash
 go build -o bin/pr-review-parser ./cmd/pr-review-parser
 go build -o bin/pr-review-reply ./cmd/pr-review-reply
+go build -o bin/pr-review-watch ./cmd/pr-review-watch
 ```
 
 The repository has no external Go dependencies. For local checks, use:
