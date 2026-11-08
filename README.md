@@ -122,6 +122,88 @@ Exit codes: `0` = new review comment found (emitted as JSON, or consensus markdo
 
 Baseline semantics: the first fetch captures the currently relevant comments (open, not outdated, non-self root comments — the same contract as the parser), keyed by comment ID. Only comments that appear **after** the watch starts count; pre-existing comments do not trigger success. New root comments trigger; a reply inside an existing thread does not. Transient poll errors (e.g. a network blip) are logged to stderr and the watch keeps polling until the deadline; a baseline fetch failure is fatal.
 
+#### Lifecycle mode: durable, head-bound reviewer waits
+
+The mode above answers "did a new comment appear?". An orchestrator that must wait for **named** reviewers on a **specific commit** — and survive a CI repair that moves the head, a restart, or a gap between two waits — needs lifecycle mode. It is opt-in with `--events`; without it every flag, output, and exit code above is unchanged.
+
+```bash
+bin/pr-review-watch 123 \
+  --events \
+  --state .git/pr-review/round-1-abc1234.json \
+  --head 1234abcd…full-sha \
+  --repo owner/repo \
+  --authors miracodeai-bot,nimuebot \
+  --timeout 30m --poll 30s
+```
+
+`--state`, `--head`, `--repo`, and `--authors` are required. `--wait-for all|any` defaults to `all`; `any` is an explicit opt-in. `--trusted-authors` stays a **separate** trust list for agent prompts and is never implied by `--authors`. Authors are matched by exact, case-insensitive login; there is no substring or `*bot` matching. Defaults in this mode are a 30m total wait and a 30s poll; each network request also has its own 30s deadline.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | `ready` — the wait condition was satisfied |
+| `1` | setup, fetch, or state error (including a rejected state file) |
+| `2` | `timeout` — the deadline passed; progress is preserved |
+| `3` | `head-changed` — the PR head is no longer the requested `--head` |
+| `4` | `closed` — the PR is closed or merged |
+
+stdout is a single versioned JSON object, printed in every outcome (including error and timeout). stderr carries progress and diagnostics:
+
+```json
+{
+  "version": 1,
+  "status": "ready",
+  "platform": "github",
+  "repo": "owner/repo",
+  "pr": 123,
+  "head": "1234abcd…",
+  "observedHead": "1234abcd…",
+  "statePath": ".git/pr-review/round-1-abc1234.json",
+  "waitFor": "all",
+  "authors": ["miracodeai-bot", "nimuebot"],
+  "responded": ["miracodeai-bot", "nimuebot"],
+  "outstanding": [],
+  "events": [
+    {
+      "id": "PRR_kwDO…",
+      "kind": "review",
+      "author": "miracodeai-bot",
+      "state": "COMMENTED",
+      "commitId": "1234abcd…",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "url": "https://…",
+      "binding": "commit",
+      "baseline": false,
+      "body": "…"
+    }
+  ],
+  "baselineEvents": 0,
+  "polls": 2,
+  "elapsedMs": 31000
+}
+```
+
+**What counts as a response.** `all` is satisfied only when every selected author has either a submitted review whose commit equals `--head`, or a top-level PR conversation comment first observed **after** the baseline. Event kinds are `review`, `review_comment` (an inline root comment), and `issue_comment`. `binding` records the evidence quality:
+
+- `commit` — a submitted review explicitly tied to `--head`. The commit is the proof, so a review already present at the baseline still counts.
+- `stable-head` — a top-level comment first seen as new between two identical head snapshots. This is temporal evidence: it is **never** claimed to be commit-bound, because the platform gives top-level comments no commit. This is how a bot that only publishes a summary can satisfy the wait.
+- `none` — no current-head binding: stale review commits, inline comments, and anything captured in the baseline.
+
+Pending and dismissed reviews never count. Inline comments are collected as evidence but never complete an author — one comment in a multi-comment review does not prove the review finished. Approval state, CI status, and thread resolution are **not** readiness. Comment bodies are stored verbatim and never executed.
+
+**Durability and resume.** The state file is the cursor: it binds to platform, repository, PR, head, `--authors`, and `--wait-for`, and it stores collected events, seen IDs, and the poll count. It is written atomically (temp file, fsync, rename) with mode `0600`, and contains no tokens or headers.
+
+- The baseline is captured and durably saved **before** the first wait proceeds; the tool prints `review-watch: armed` on stderr only after that save. Start CI (or any other head-moving work) on that marker, not before.
+- A timeout saves progress and exits `2`. Resuming the same `--state` does not rebaseline, so events that landed while no watcher was running — including during a CI repair — still count.
+- A malformed, symlinked, group/other-writable, wrong-version, or differently-bound state file is a hard error (exit `1`). The file is never silently reset or rewritten. To start watching a new head, use a **new** state path per round, e.g. `round-<n>-<head7>.json`.
+- The head is read before and after every event fetch. Events collected across a head move are discarded rather than credited to the old head, and the round ends as `head-changed`.
+- Transient API failures are retried with the cursor intact; three consecutive failed observations stop with error (`1`), rather than waiting out missing CLI/authentication setup. A round with only API failures also reports error, not missing reviews.
+- `--timeout` bounds the whole round, including in-flight paginated HTTP/CLI reads. Deadline-expired observations never report ready. `observedHead` reports the last successfully read head, including on ready, timeout, and later errors.
+- Forgejo review and conversation pagination continues until an empty page, even when the server clamps the requested page size. Hitting the 50-page safety cap is an incomplete-observation error, never partial readiness.
+
+On GitHub this mode uses the `gh` CLI (GraphQL for head state, reviews, and review threads; the REST paginated issue-comment endpoint). On Forgejo it uses the REST API with `FORGEJO_URL`/`FORGEJO_TOKEN`, reading review `state`/`dismissed`/`commit_id`/`submitted_at`, per-review inline comments, and top-level issue comments. `--repo` selects the receiving repository; the platform is still detected from the `origin` remote, so a watch cannot be redirected to another host by the flag. All subprocess calls use argument vectors, never shell strings.
+
 ### Replied to every reviewer
 
 Post a short custom reply to one comment and resolve its thread (GitHub):

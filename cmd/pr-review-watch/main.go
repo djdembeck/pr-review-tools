@@ -14,6 +14,9 @@
 //
 //	pr-review-watch <pr-number> [--timeout 15m] [--poll 30s] [--authors <csv>]
 //	    [--trusted-authors <csv>] [--include-self] [--format json|consensus]
+//
+// With --events, wait durably for all selected reviewers at a pinned PR head.
+// Versioned JSON distinguishes readiness, timeout, head drift, closure and errors.
 package main
 
 import (
@@ -23,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
 	"github.com/djdembeck/pr-review-tools/internal/review"
 )
 
@@ -34,16 +38,31 @@ const (
 
 const usageText = `Usage: pr-review-watch <pr-number> [flags]
 
+Waits for reviewers on a pull request. Two modes:
+
+  default      poll for a new relevant root review comment, then exit 0
+  --events     durable, head-bound lifecycle wait with a versioned JSON result
+
 Flags:
-  --timeout <duration>    Stop waiting after this duration (default: 15m; e.g. 30s, 15m, 1h)
+  --timeout <duration>    Stop waiting after this duration (default: 15m legacy, 30m lifecycle; e.g. 30s, 15m, 1h)
   --poll <duration>       Poll interval (default: 30s)
-  --authors <csv>         Only wait for new root comments from these logins (default: all reviewers)
+  --authors <csv>         Only wait for comments/reviews from these logins (default: all reviewers)
   --trusted-authors <csv> Trusted author logins (agent prompts only emitted for these exact logins)
   --include-self          Include comments authored by the authenticated user (default: exclude)
-  --format json|consensus Output format (default: json)
+  --format json|consensus Output format, legacy mode only (default: json)
+  --events                Enable lifecycle mode (durable state, typed events)
+  --state <path>          Lifecycle mode: durable state file (created 0600, atomic writes)
+  --head <sha>            Lifecycle mode: PR head SHA that reviews must bind to
+  --repo <owner/repo>     Lifecycle mode: receiving repository (host still detected from origin)
+  --wait-for all|any      Lifecycle mode: require all selected authors or any one (default: all)
   --help, -h              Show this help
 
-Exit codes: 0 = new review comment found; 1 = usage/setup/fetch error; 2 = timed out.`
+Lifecycle mode prints one JSON status object on stdout and logs progress to
+stderr. The marker "review-watch: armed" appears once the baseline is durable,
+so CI may start before the reviewers respond.
+
+Exit codes (legacy):    0 = new review comment found; 1 = usage/setup/fetch error; 2 = timed out.
+Exit codes (lifecycle): 0 = ready; 1 = setup/fetch/state error; 2 = timed out; 3 = head changed; 4 = PR closed.`
 
 func printUsage() {
 	fmt.Fprintln(os.Stderr, usageText)
@@ -115,7 +134,7 @@ func selectRelevant(raw []review.RawComment, authors, trustedAuthors []string, s
 	return out
 }
 
-func main() {
+func runLegacyMain() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		printUsage()
@@ -342,4 +361,376 @@ func filterOutSelf(comments []review.ParsedComment, selfLogin string) []review.P
 		out = append(out, c)
 	}
 	return out
+}
+
+func main() {
+	for _, arg := range os.Args[1:] {
+		if arg != "--events" {
+			continue
+		}
+		args := os.Args[1:]
+		pr, help, headErr := parseHead(args)
+		if help {
+			printUsage()
+			return
+		}
+		if headErr != "" {
+			fmt.Fprintln(os.Stderr, headErr)
+			os.Exit(1)
+		}
+		opts, ok := parseFlags(args, pr)
+		if !ok {
+			os.Exit(1)
+		}
+		os.Exit(runLifecycleMode(opts))
+	}
+	runLegacyMain()
+}
+
+const exitHeadChanged = 3
+
+const exitPRClosed = 4
+
+// watchOptions is the parsed shape of every flag, both modes. Lifecycle-only
+// fields are rejected unless --events is present, so they can never be
+// silently ignored.
+type watchOptions struct {
+	pr      int
+	poll    time.Duration
+	timeout time.Duration
+	// timeoutSet records an explicit --timeout so the longer lifecycle
+	// default never overrides it.
+	timeoutSet bool
+	format     string
+	authors    []string
+	trusted    []string
+	self       bool
+
+	// Lifecycle mode.
+	events  bool
+	state   string
+	head    string
+	repo    string
+	waitFor string
+}
+
+// parseFlags parses every flag of both modes. It prints the usage error and
+// returns false when an invocation must exit 1, so callers stay testable.
+func parseFlags(args []string, pr int) (watchOptions, bool) {
+	opts := watchOptions{
+		pr:      pr,
+		timeout: defaultTimeout,
+		poll:    defaultPoll,
+		format:  "json",
+		waitFor: review.WaitForAll,
+	}
+
+	// lifecycleFlags and legacyFlags record mode-specific flags so an
+	// invocation that mixes the two modes fails closed instead of silently
+	// ignoring a flag.
+	var lifecycleFlags []string
+	var legacyFlags []string
+	requiresValue := func(i int, flag string) (string, bool) {
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+			fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", flag)
+			return "", false
+		}
+		return args[i+1], true
+	}
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--timeout":
+			if i+1 < len(args) {
+				d, err := time.ParseDuration(args[i+1])
+				if err != nil || d <= 0 {
+					fmt.Fprintf(os.Stderr, "Error: --timeout must be a positive duration (e.g. 15m), got '%s'\n", args[i+1])
+					return opts, false
+				}
+				opts.timeout = d
+				opts.timeoutSet = true
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --timeout requires a value")
+				return opts, false
+			}
+		case "--poll":
+			if i+1 < len(args) {
+				d, err := time.ParseDuration(args[i+1])
+				if err != nil || d <= 0 {
+					fmt.Fprintf(os.Stderr, "Error: --poll must be a positive duration (e.g. 30s), got '%s'\n", args[i+1])
+					return opts, false
+				}
+				opts.poll = d
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --poll requires a value")
+				return opts, false
+			}
+		case "--authors":
+			if i+1 < len(args) {
+				opts.authors = append(opts.authors, parseCSVLogins("authors", args[i+1])...)
+				if len(opts.authors) == 0 {
+					fmt.Fprintln(os.Stderr, "Error: --authors requires a non-empty value")
+					return opts, false
+				}
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --authors requires a non-empty value")
+				return opts, false
+			}
+		case "--trusted-authors":
+			if i+1 < len(args) {
+				opts.trusted = append(opts.trusted, parseCSVLogins("trusted-authors", args[i+1])...)
+				if len(opts.trusted) == 0 {
+					fmt.Fprintln(os.Stderr, "Error: --trusted-authors requires a non-empty value")
+					return opts, false
+				}
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --trusted-authors requires a non-empty value")
+				return opts, false
+			}
+		case "--include-self":
+			opts.self = true
+			legacyFlags = append(legacyFlags, "--include-self")
+		case "--format":
+			if i+1 < len(args) {
+				f := args[i+1]
+				if f == "json" || f == "consensus" {
+					opts.format = f
+					i++
+					legacyFlags = append(legacyFlags, "--format")
+				} else {
+					fmt.Fprintf(os.Stderr, "Error: --format must be 'json' or 'consensus', got '%s'\n", f)
+					return opts, false
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --format requires a value")
+				return opts, false
+			}
+		case "--events":
+			opts.events = true
+		case "--state":
+			v, ok := requiresValue(i, "--state")
+			if !ok {
+				return opts, false
+			}
+			opts.state = v
+			i++
+			lifecycleFlags = append(lifecycleFlags, "--state")
+		case "--head":
+			v, ok := requiresValue(i, "--head")
+			if !ok {
+				return opts, false
+			}
+			opts.head = v
+			i++
+			lifecycleFlags = append(lifecycleFlags, "--head")
+		case "--repo":
+			v, ok := requiresValue(i, "--repo")
+			if !ok {
+				return opts, false
+			}
+			opts.repo = v
+			i++
+			lifecycleFlags = append(lifecycleFlags, "--repo")
+		case "--wait-for":
+			v, ok := requiresValue(i, "--wait-for")
+			if !ok {
+				return opts, false
+			}
+			if v != review.WaitForAll && v != review.WaitForAny {
+				fmt.Fprintf(os.Stderr, "Error: --wait-for must be 'all' or 'any', got '%s'\n", v)
+				return opts, false
+			}
+			opts.waitFor = v
+			i++
+			lifecycleFlags = append(lifecycleFlags, "--wait-for")
+		default:
+			fmt.Fprintf(os.Stderr, "Error: unknown flag '%s'\n", args[i])
+			printUsage()
+			return opts, false
+		}
+	}
+
+	if !opts.events {
+		// Legacy mode never varies its behavior on a lifecycle flag: an
+		// invocation that passes one is a mistake and must fail closed.
+		if len(lifecycleFlags) > 0 {
+			fmt.Fprintf(os.Stderr, "Error: %s requires --events (lifecycle mode)\n", lifecycleFlags[0])
+			return opts, false
+		}
+		// A poll interval of at least the timeout guarantees the deadline
+		// fires before the first tick: zero polls run and the run reads as
+		// "no comments in <timeout>". Reject the combination at flag
+		// validation (usage error, exit 1). Lifecycle mode needs no such
+		// guard: its deadline is enforced inside each poll.
+		if opts.poll >= opts.timeout {
+			fmt.Fprintf(os.Stderr, "Error: --poll (%s) must be less than --timeout (%s); otherwise the deadline fires before any poll runs\n", opts.poll, opts.timeout)
+			return opts, false
+		}
+	}
+	if opts.events && len(legacyFlags) > 0 {
+		// Lifecycle mode prints a JSON result and never reprints comments, so
+		// a legacy-only flag cannot take effect: refuse it rather than
+		// silently ignoring it. (--include-self has no meaning either: the
+		// lifecycle selection is the exact --authors set.)
+		fmt.Fprintf(os.Stderr, "Error: %s has no effect in lifecycle mode\n", legacyFlags[0])
+		return opts, false
+	}
+	return opts, true
+}
+
+// runLifecycleMode executes one durable, head-bound lifecycle round and prints
+// its versioned result object.
+func runLifecycleMode(opts watchOptions) int {
+	remote, err := review.GetGitRemote()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return emitSetupError(newLifecycleEnvelope(opts), err)
+	}
+	owner, repo, platform, err := resolveTargetFromRemote(remote, opts.repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return emitSetupError(newLifecycleEnvelope(opts), err)
+	}
+
+	envelope := newLifecycleEnvelope(opts)
+	envelope.Platform = platform
+	envelope.Repo = owner + "/" + repo
+
+	backend, err := review.NewEventBackend(platform, owner, repo, opts.pr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return emitSetupError(envelope, err)
+	}
+
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	fmt.Fprintf(os.Stderr, "- Lifecycle %s repo: %s/%s #%d at head %s\n",
+		platform, owner, repo, opts.pr, shortHead(opts.head))
+
+	result, runErr := review.RunLifecycle(lifecycleConfig(opts, platform, owner, repo, backend, logf))
+	emitLifecycleResult(result)
+
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", runErr)
+		return 1
+	}
+	return lifecycleExitCode(result.Status)
+}
+
+// newLifecycleEnvelope is the result skeleton for failures that happen before
+// the platform and repo are known, so every lifecycle invocation still emits
+// one machine-readable object.
+func newLifecycleEnvelope(opts watchOptions) review.LifecycleResult {
+	return review.LifecycleResult{
+		Version:   review.ResultVersion,
+		PR:        opts.pr,
+		Head:      opts.head,
+		StatePath: opts.state,
+		WaitFor:   opts.waitFor,
+		Authors:   review.NormalizeAuthors(opts.authors),
+		Events:    []review.CollectedEvent{},
+		Responded: []string{},
+	}
+}
+
+// lifecycleConfig assembles the round configuration from parsed flags.
+func lifecycleConfig(opts watchOptions, platform review.Platform, owner, repo string, backend review.EventBackend, logf func(string, ...any)) review.LifecycleConfig {
+	cfg := review.LifecycleConfig{
+		Platform:       platform,
+		Owner:          owner,
+		Repo:           repo,
+		PR:             opts.pr,
+		Head:           opts.head,
+		StatePath:      opts.state,
+		Authors:        opts.authors,
+		TrustedAuthors: opts.trusted,
+		WaitFor:        opts.waitFor,
+		Timeout:        opts.timeout,
+		Poll:           opts.poll,
+		Backend:        backend,
+		Log:            logf,
+	}
+	if !opts.timeoutSet {
+		// The documented lifecycle default is longer than the legacy one; an
+		// explicit --timeout always wins on either path.
+		cfg.Timeout = review.DefaultLifecycleTimeout
+	}
+	return cfg
+}
+
+// resolveTargetFromRemote selects the receiving repository from --repo while
+// the platform still comes from the origin remote, so the flag cannot redirect
+// a watch to another host.
+func resolveTargetFromRemote(remote, override string) (string, string, review.Platform, error) {
+	platform := review.DetectPlatform(remote)
+	trimmed := strings.Trim(strings.TrimSpace(override), "/")
+	if trimmed == "" {
+		return "", "", platform, fmt.Errorf("lifecycle mode requires --repo owner/repo (the receiving repository)")
+	}
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", platform, fmt.Errorf("--repo must be owner/repo, got %q", override)
+	}
+	return parts[0], parts[1], platform, nil
+}
+
+// lifecycleExitCode maps a lifecycle status onto its documented exit code.
+func lifecycleExitCode(status string) int {
+	switch status {
+	case review.StatusReady:
+		return 0
+	case review.StatusTimeout:
+		return exitTimeout
+	case review.StatusHeadChanged:
+		return exitHeadChanged
+	case review.StatusClosed:
+		return exitPRClosed
+	default:
+		return 1
+	}
+}
+
+// emitSetupError prints a complete error envelope for a failure that happened
+// before the lifecycle round could start.
+func emitSetupError(result review.LifecycleResult, err error) int {
+	result.Status = review.StatusError
+	result.Error = err.Error()
+	emitLifecycleResult(result)
+	return 1
+}
+
+// emitLifecycleResult writes exactly one JSON object to stdout, so a caller can
+// parse it regardless of progress logs on stderr.
+func emitLifecycleResult(result review.LifecycleResult) {
+	if result.Events == nil {
+		result.Events = []review.CollectedEvent{}
+	}
+	if result.Responded == nil {
+		result.Responded = []string{}
+	}
+	if result.Outstanding == nil {
+		result.Outstanding = []string{}
+	}
+	if result.Authors == nil {
+		result.Authors = []string{}
+	}
+	payload, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: could not encode lifecycle result: %v\n", err)
+		return
+	}
+	fmt.Println(string(payload))
+}
+
+// shortHead abbreviates a SHA for progress logs.
+func shortHead(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
 }

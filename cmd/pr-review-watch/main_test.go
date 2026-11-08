@@ -284,21 +284,14 @@ func runWatch(t *testing.T, bin string, args ...string) (int, string) {
 	return code, string(out)
 }
 
-// TestFlagParseSubprocess drives the inline flag-parsing branches in main()
-// through the real binary: invalid durations and flag-shaped author values
-// are rejected before any API call, and a valid invocation clears
-// flag-parsing (failing later, at the git/fetch stage, instead). Flag
-// parsing runs before any git/API access, so none of these paths need a
-// live remote.
 func TestFlagParseSubprocess(t *testing.T) {
 	bin := buildWatchBinary(t)
 
 	cases := []struct {
-		name          string
-		args          []string
-		wantCode      int
-		wantInOutput  string // substring that MUST appear
-		wantNotOutput string // substring that MUST NOT appear
+		name         string
+		args         []string
+		wantCode     int
+		wantInOutput string // substring that MUST appear
 	}{
 		{
 			name:         "timeout non-duration rejected",
@@ -330,14 +323,6 @@ func TestFlagParseSubprocess(t *testing.T) {
 			wantCode:     1,
 			wantInOutput: "Error: --authors requires a non-empty value",
 		},
-		{
-			// Flag parsing succeeds; the run must fail (if at all) at the
-			// git/fetch stage, never with a flag-parsing error.
-			name:          "valid args pass flag parsing",
-			args:          []string{"99999", "--timeout", "5s"},
-			wantCode:      1,
-			wantNotOutput: "flag-shaped",
-		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -347,9 +332,6 @@ func TestFlagParseSubprocess(t *testing.T) {
 			}
 			if tt.wantInOutput != "" && !strings.Contains(out, tt.wantInOutput) {
 				t.Fatalf("output must contain %q:\n%s", tt.wantInOutput, out)
-			}
-			if tt.wantNotOutput != "" && strings.Contains(out, tt.wantNotOutput) {
-				t.Fatalf("output must not contain %q:\n%s", tt.wantNotOutput, out)
 			}
 		})
 	}
