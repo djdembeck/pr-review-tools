@@ -2,6 +2,7 @@ package review
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // forgejoEnv reads FORGEJO_URL and FORGEJO_TOKEN. Overridable in tests to avoid
@@ -31,7 +33,7 @@ func getForgejoEnv() (string, string) {
 // forgejoRequest performs an HTTP request against the Forgejo API using the
 // FORGEJO_URL and FORGEJO_TOKEN env vars. method is the HTTP verb, endpoint is
 // the path after /api/v1/. body may be nil for GET requests.
-func forgejoRequest(method, endpoint string, body []byte) (string, error) {
+func forgejoRequest(ctx context.Context, method, endpoint string, body []byte) (string, error) {
 	baseURL, token := getForgejoEnv()
 	if baseURL == "" || token == "" {
 		return "", fmt.Errorf("FORGEJO_URL and FORGEJO_TOKEN must be set for Forgejo repos")
@@ -46,7 +48,7 @@ func forgejoRequest(method, endpoint string, body []byte) (string, error) {
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, u, reader)
+	req, err := http.NewRequestWithContext(ctx, method, u, reader)
 	if err != nil {
 		return "", fmt.Errorf("build forgejo request: %w", err)
 	}
@@ -54,7 +56,7 @@ func forgejoRequest(method, endpoint string, body []byte) (string, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "token "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := forgejoHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("forgejo API request failed: %w", err)
 	}
@@ -76,21 +78,27 @@ func forgejoRequest(method, endpoint string, body []byte) (string, error) {
 	return string(respBody), nil
 }
 
+// forgejoHTTPClient is the HTTP client for Forgejo API requests. Context
+// cancellation on ctx bounds request lifetime (a blocked fetch must honor a
+// caller deadline); the client-level timeout is a safety net for requests
+// whose context has no deadline. Overridable in tests.
+var forgejoHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
 // forgejoGet is a convenience GET wrapper.
-func forgejoGet(endpoint string) (string, error) {
-	return forgejoRequest(http.MethodGet, endpoint, nil)
+func forgejoGet(ctx context.Context, endpoint string) (string, error) {
+	return forgejoRequest(ctx, http.MethodGet, endpoint, nil)
 }
 
 // forgejoPost is a convenience POST wrapper.
-func forgejoPost(endpoint string, body []byte) (string, error) {
-	return forgejoRequest(http.MethodPost, endpoint, body)
+func forgejoPost(ctx context.Context, endpoint string, body []byte) (string, error) {
+	return forgejoRequest(ctx, http.MethodPost, endpoint, body)
 }
 
 // FetchForgejoComments fetches all review comments for the given PR by
 // iterating over reviews and their comment subsets, normalizing each into a
 // RawComment.
-func FetchForgejoComments(owner, repo string, prNumber int) ([]RawComment, error) {
-	reviewsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
+func FetchForgejoComments(ctx context.Context, owner, repo string, prNumber int) ([]RawComment, error) {
+	reviewsRaw, err := forgejoGet(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +113,7 @@ func FetchForgejoComments(owner, repo string, prNumber int) ([]RawComment, error
 		if reviewID == "" {
 			continue
 		}
-		commentsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID))
+		commentsRaw, err := forgejoGet(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID))
 		if err != nil {
 			return nil, err
 		}
@@ -145,8 +153,8 @@ func FetchForgejoComments(owner, repo string, prNumber int) ([]RawComment, error
 
 // findForgejoReviewIDForComment returns the review ID and the matched comment
 // for the given comment ID by iterating over the PR's reviews.
-func findForgejoReviewIDForComment(owner, repo string, prNumber int, commentID string) (string, forgejoComment, error) {
-	reviewsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
+func findForgejoReviewIDForComment(ctx context.Context, owner, repo string, prNumber int, commentID string) (string, forgejoComment, error) {
+	reviewsRaw, err := forgejoGet(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
 	if err != nil {
 		return "", forgejoComment{}, err
 	}
@@ -160,7 +168,7 @@ func findForgejoReviewIDForComment(owner, repo string, prNumber int, commentID s
 		if reviewID == "" {
 			continue
 		}
-		commentsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID))
+		commentsRaw, err := forgejoGet(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID))
 		if err != nil {
 			continue
 		}
@@ -182,10 +190,10 @@ func findForgejoReviewIDForComment(owner, repo string, prNumber int, commentID s
 //  1. GitHub-compatible /comments/{id}/replies endpoint (threaded, Gitea 1.24+)
 //  2. /reviews/{id}/comments with path+position (threaded, current fix)
 //  3. /issues/{pr}/comments as issue comment (fallback for summary comments)
-func forgejoTryReply(owner, repo string, prNumber int, commentID, body, reviewID string, parent forgejoComment) (ReplyResult, error) {
+func forgejoTryReply(ctx context.Context, owner, repo string, prNumber int, commentID, body, reviewID string, parent forgejoComment) (ReplyResult, error) {
 	// 1. Try the GitHub-compatible reply endpoint (Gitea 1.24+)
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	output, err := forgejoPost(fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%s/replies", owner, repo, prNumber, commentID), payload)
+	output, err := forgejoPost(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%s/replies", owner, repo, prNumber, commentID), payload)
 	if err == nil {
 		return parseForgejoReplyResponse(output)
 	}
@@ -208,14 +216,14 @@ func forgejoTryReply(owner, repo string, prNumber int, commentID, body, reviewID
 			reviewPayload["old_position"] = origPos
 		}
 		reviewPayloadBytes, _ := json.Marshal(reviewPayload)
-		output, err := forgejoPost(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID), reviewPayloadBytes)
+		output, err := forgejoPost(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews/%s/comments", owner, repo, prNumber, reviewID), reviewPayloadBytes)
 		if err == nil {
 			return parseForgejoReplyResponse(output)
 		}
 	}
 
 	// 3. Issue comment fallback (for summary comments or when strategy 2 failed)
-	output, err = forgejoPost(fmt.Sprintf("repos/%s/%s/issues/%d/comments", owner, repo, prNumber), payload)
+	output, err = forgejoPost(ctx, fmt.Sprintf("repos/%s/%s/issues/%d/comments", owner, repo, prNumber), payload)
 	if err != nil {
 		return ReplyResult{Success: false, Error: err.Error()}, nil
 	}
@@ -247,24 +255,24 @@ func parseForgejoReplyResponse(output string) (ReplyResult, error) {
 
 // PostForgejoReply posts a reply to a Forgejo review comment via the REST API.
 // When dryRun is true no request is made.
-func PostForgejoReply(owner, repo string, prNumber int, commentID, body string, dryRun bool) (ReplyResult, error) {
+func PostForgejoReply(ctx context.Context, owner, repo string, prNumber int, commentID, body string, dryRun bool) (ReplyResult, error) {
 	if dryRun {
 		return ReplyResult{Success: true}, nil
 	}
 
-	reviewID, parent, err := findForgejoReviewIDForComment(owner, repo, prNumber, commentID)
+	reviewID, parent, err := findForgejoReviewIDForComment(ctx, owner, repo, prNumber, commentID)
 	if err != nil {
 		// Still try without review ID — reply endpoint doesn't need it
-		return forgejoTryReply(owner, repo, prNumber, commentID, body, "", forgejoComment{})
+		return forgejoTryReply(ctx, owner, repo, prNumber, commentID, body, "", forgejoComment{})
 	}
 
-	return forgejoTryReply(owner, repo, prNumber, commentID, body, reviewID, parent)
+	return forgejoTryReply(ctx, owner, repo, prNumber, commentID, body, reviewID, parent)
 }
 
 // DetectForgejoBotName inspects the PR's review authors for a Mira bot and
 // returns the first match, falling back to "miracodeai-bot".
-func DetectForgejoBotName(owner, repo string, prNumber int) (string, error) {
-	reviewsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
+func DetectForgejoBotName(ctx context.Context, owner, repo string, prNumber int) (string, error) {
+	reviewsRaw, err := forgejoGet(ctx, fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
 	if err != nil {
 		return "miracodeai-bot", nil
 	}

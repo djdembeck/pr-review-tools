@@ -1,15 +1,16 @@
 package review
 
 import (
+	"context"
 	"encoding/json"
 )
 
 // SelfLogin returns the login of the authenticated user for the given
 // platform. GitHub uses the gh CLI; Forgejo uses the /user API endpoint.
-func SelfLogin(platform Platform) (string, error) {
+func SelfLogin(ctx context.Context, platform Platform) (string, error) {
 	switch platform {
 	case PlatformForgejo:
-		raw, err := forgejoGet("user")
+		raw, err := forgejoGet(ctx, "user")
 		if err != nil {
 			return "", err
 		}
@@ -21,7 +22,7 @@ func SelfLogin(platform Platform) (string, error) {
 		}
 		return user.Login, nil
 	default:
-		out, err := ghRunGuarded([]string{"api", "user", "--jq", ".login"})
+		out, err := ghRunGuarded(ctx, []string{"api", "user", "--jq", ".login"})
 		if err != nil {
 			return "", err
 		}

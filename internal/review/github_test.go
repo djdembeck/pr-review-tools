@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -138,7 +139,7 @@ func TestFindThreadID(t *testing.T) {
 }
 
 // setGhRunEnv overrides the gh CLI seam for the duration of the test.
-func setGhRunEnv(t *testing.T, fn func(args []string) (string, error)) {
+func setGhRunEnv(t *testing.T, fn func(ctx context.Context, args []string) (string, error)) {
 	t.Helper()
 	ghRunMu.Lock()
 	origFn := ghRun
@@ -199,7 +200,7 @@ func TestFetchGitHubCommentsPagination(t *testing.T) {
 	var commentPageArgs []string
 	pageInfoStop := `{"hasNextPage":false,"endCursor":null}`
 
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		query, _ := ghField(args, "query")
 		var nodes []string
 		var pageInfo string
@@ -262,7 +263,7 @@ func TestFetchGitHubCommentsPagination(t *testing.T) {
 		}
 	})
 
-	got, err := FetchGitHubComments("owner", "repo", 42)
+	got, err := FetchGitHubComments(context.Background(), "owner", "repo", 42)
 	if err != nil {
 		t.Fatalf("FetchGitHubComments: %v", err)
 	}
@@ -360,14 +361,14 @@ func TestCheckGitHubGraphQLPageMissingPullRequestData(t *testing.T) {
 		t.Fatalf("checkGitHubGraphQLPage: want missing pullRequest error, got %v", err)
 	}
 
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		query, _ := ghField(args, "query")
 		if !strings.Contains(query, "reviewThreads(") {
 			return "", fmt.Errorf("unexpected query: %.40s", query)
 		}
 		return `{"data":{"repository":{}}}`, nil
 	})
-	if _, err := FetchGitHubComments("owner", "repo", 42); err == nil ||
+	if _, err := FetchGitHubComments(context.Background(), "owner", "repo", 42); err == nil ||
 		err.Error() != "no pull request data in GraphQL response" {
 		t.Fatalf("FetchGitHubComments: want missing pullRequest surface error, got %v", err)
 	}
@@ -393,7 +394,7 @@ func TestFetchGitHubCommentsThreadCommentsPageNodeNull(t *testing.T) {
 
 	// Surface: a second comment page whose node(id:) response has
 	// data.node == null must error (not panic) from FetchGitHubComments.
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		query, _ := ghField(args, "query")
 		switch {
 		case strings.Contains(query, "reviewThreads("):
@@ -405,7 +406,7 @@ func TestFetchGitHubCommentsThreadCommentsPageNodeNull(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected query: %.40s", query)
 	})
-	if _, err := FetchGitHubComments("owner", "repo", 42); err == nil ||
+	if _, err := FetchGitHubComments(context.Background(), "owner", "repo", 42); err == nil ||
 		err.Error() != "no review thread data in GraphQL response" {
 		t.Fatalf("FetchGitHubComments: want nil-node surface error, got %v", err)
 	}
@@ -418,7 +419,7 @@ func TestFetchGitHubCommentsThreadCommentsPageNodeNull(t *testing.T) {
 // (proving the errors branch, not the nil-node branch, fires).
 func TestFetchGitHubCommentsThreadCommentsPageGraphQLError(t *testing.T) {
 	const threadID = "PRRT_graphqlerr"
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		query, _ := ghField(args, "query")
 		switch {
 		case strings.Contains(query, "reviewThreads("):
@@ -431,7 +432,7 @@ func TestFetchGitHubCommentsThreadCommentsPageGraphQLError(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected query: %.40s", query)
 	})
-	if _, err := FetchGitHubComments("owner", "repo", 42); err == nil ||
+	if _, err := FetchGitHubComments(context.Background(), "owner", "repo", 42); err == nil ||
 		err.Error() != "GraphQL error: thread comments query failed" {
 		t.Fatalf("FetchGitHubComments: want GraphQL error surface, got %v", err)
 	}
@@ -443,11 +444,11 @@ func TestFetchGitHubCommentsThreadCommentsPageGraphQLError(t *testing.T) {
 // failure.
 func TestDetectGitHubBotNameGhRunErrorFallback(t *testing.T) {
 	calls := 0
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		calls++
 		return "", fmt.Errorf("gh command failed: network unreachable")
 	})
-	got, err := DetectGitHubBotName("owner", "repo", 42)
+	got, err := DetectGitHubBotName(context.Background(), "owner", "repo", 42)
 	if err != nil {
 		t.Fatalf("DetectGitHubBotName: want nil error on gh failure, got %v", err)
 	}
@@ -465,7 +466,7 @@ func TestFetchGitHubCommentsSinglePage(t *testing.T) {
 	// The two-thread fixture carries no pageInfo; a missing pageInfo
 	// unmarshals to hasNextPage=false, so the paginated client must make
 	// exactly one request with no after cursor.
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		query, _ := ghField(args, "query")
 		if !strings.Contains(query, "reviewThreads(") {
 			return "", fmt.Errorf("unexpected query: %.40s", query)
@@ -476,7 +477,7 @@ func TestFetchGitHubCommentsSinglePage(t *testing.T) {
 		return twoThreadGraphQLFixture, nil
 	})
 
-	got, err := FetchGitHubComments("owner", "repo", 7)
+	got, err := FetchGitHubComments(context.Background(), "owner", "repo", 7)
 	if err != nil {
 		t.Fatalf("FetchGitHubComments: %v", err)
 	}
@@ -491,13 +492,13 @@ func TestFetchGitHubCommentsSinglePage(t *testing.T) {
 // TestSelfLoginGitHubViaSeam verifies SelfLogin on GitHub routes through the
 // guarded gh seam (not the real gh CLI) and returns the login from the seam.
 func TestSelfLoginGitHubViaSeam(t *testing.T) {
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		if len(args) == 0 || args[0] != "api" {
 			return "", fmt.Errorf("unexpected gh args: %v", args)
 		}
 		return "alice", nil
 	})
-	login, err := SelfLogin(PlatformGitHub)
+	login, err := SelfLogin(context.Background(), PlatformGitHub)
 	if err != nil {
 		t.Fatalf("SelfLogin: %v", err)
 	}
@@ -520,7 +521,7 @@ func botThreadJSON(login string) string {
 func TestDetectGitHubBotNamePagination(t *testing.T) {
 	t.Run("second page match", func(t *testing.T) {
 		calls := 0
-		setGhRunEnv(t, func(args []string) (string, error) {
+		setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 			calls++
 			after, _ := ghField(args, "after")
 			nodes := make([]string, 0, 50)
@@ -545,7 +546,7 @@ func TestDetectGitHubBotNamePagination(t *testing.T) {
 				strings.Join(nodes, ","), pageInfo), nil
 
 		})
-		got, err := DetectGitHubBotName("owner", "repo", 42)
+		got, err := DetectGitHubBotName(context.Background(), "owner", "repo", 42)
 		if err != nil {
 			t.Fatalf("DetectGitHubBotName: %v", err)
 		}
@@ -559,7 +560,7 @@ func TestDetectGitHubBotNamePagination(t *testing.T) {
 
 	t.Run("first page match early-exits", func(t *testing.T) {
 		calls := 0
-		setGhRunEnv(t, func(args []string) (string, error) {
+		setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 			calls++
 			if _, ok := ghField(args, "after"); ok {
 				return "", fmt.Errorf("first-page match must not send an after cursor")
@@ -569,7 +570,7 @@ func TestDetectGitHubBotNamePagination(t *testing.T) {
 				`],"pageInfo":{"hasNextPage":true,"endCursor":"should-not-use"}}}}}}`, nil
 
 		})
-		got, err := DetectGitHubBotName("owner", "repo", 7)
+		got, err := DetectGitHubBotName(context.Background(), "owner", "repo", 7)
 		if err != nil {
 			t.Fatalf("DetectGitHubBotName: %v", err)
 		}
@@ -585,7 +586,7 @@ func TestDetectGitHubBotNamePagination(t *testing.T) {
 // TestDetectGitHubBotNameNoMatch verifies the fallback when no Mira author is
 // found across all pages.
 func TestDetectGitHubBotNameNoMatch(t *testing.T) {
-	setGhRunEnv(t, func(args []string) (string, error) {
+	setGhRunEnv(t, func(ctx context.Context, args []string) (string, error) {
 		if _, ok := ghField(args, "after"); ok {
 			return "", fmt.Errorf("no second page expected")
 		}
@@ -593,7 +594,7 @@ func TestDetectGitHubBotNameNoMatch(t *testing.T) {
 			botThreadJSON("humana") +
 			`],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`, nil
 	})
-	got, err := DetectGitHubBotName("owner", "repo", 9)
+	got, err := DetectGitHubBotName(context.Background(), "owner", "repo", 9)
 	if err != nil {
 		t.Fatalf("DetectGitHubBotName: %v", err)
 	}

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,34 +13,18 @@ import (
 	"github.com/djdembeck/pr-review-tools/internal/review"
 )
 
-// TestFilterOutSelf verifies the self-exclusion contract: self-authored
-// comments are dropped case-insensitively and everything else is kept
-// unchanged.
-func TestFilterOutSelf(t *testing.T) {
-	comments := []review.ParsedComment{
-		{ID: "1", Author: "me"},
-		{ID: "2", Author: "ME"},
-		{ID: "3", Author: "nimuebot"},
-	}
-	got := filterOutSelf(comments, "Me")
-	if len(got) != 1 || got[0].ID != "3" {
-		t.Fatalf("expected only the non-self comment to survive, got %+v", got)
-	}
-}
-
 // TestWatchFindsNewComment verifies the success path: a comment whose ID
 // was not in the baseline is returned in fetch order.
 func TestWatchFindsNewComment(t *testing.T) {
 	calls := 0
-	fetch := func() ([]review.ParsedComment, error) {
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
 		calls++
 		if calls == 1 {
 			return []review.ParsedComment{{ID: "a"}}, nil
 		}
 		return []review.ParsedComment{{ID: "a"}, {ID: "b"}}, nil
 	}
-	baseline := []review.ParsedComment{{ID: "a"}}
-	fresh, polls, waited, err := watch(baseline, 2*time.Second, 10*time.Millisecond, fetch)
+	fresh, polls, waited, err := watch(context.Background(), []string{"a"}, 2*time.Second, 10*time.Millisecond, fetch)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -56,13 +42,15 @@ func TestWatchFindsNewComment(t *testing.T) {
 // TestWatchTimesOut verifies the timeout path: no new comment before the
 // deadline yields a timeout error and no comments.
 func TestWatchTimesOut(t *testing.T) {
-	fetch := func() ([]review.ParsedComment, error) {
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
 		return []review.ParsedComment{{ID: "a"}}, nil
 	}
-	baseline := []review.ParsedComment{{ID: "a"}}
-	fresh, _, _, err := watch(baseline, 100*time.Millisecond, 10*time.Millisecond, fetch)
+	fresh, _, _, err := watch(context.Background(), []string{"a"}, 100*time.Millisecond, 10*time.Millisecond, fetch)
 	if err == nil {
 		t.Fatal("expected a timeout error, got nil")
+	}
+	if !errors.Is(err, errWatchTimeout) {
+		t.Fatalf("expected errWatchTimeout, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "no new review comments") {
 		t.Fatalf("timeout error must mention no new review comments, got: %v", err)
@@ -77,7 +65,7 @@ func TestWatchTimesOut(t *testing.T) {
 // once a new comment appears.
 func TestWatchIgnoresTransientErrors(t *testing.T) {
 	calls := 0
-	fetch := func() ([]review.ParsedComment, error) {
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
 		calls++
 		switch calls {
 		case 1:
@@ -88,8 +76,7 @@ func TestWatchIgnoresTransientErrors(t *testing.T) {
 			return []review.ParsedComment{{ID: "a"}, {ID: "b"}}, nil
 		}
 	}
-	baseline := []review.ParsedComment{{ID: "a"}}
-	fresh, _, _, err := watch(baseline, 2*time.Second, 10*time.Millisecond, fetch)
+	fresh, _, _, err := watch(context.Background(), []string{"a"}, 2*time.Second, 10*time.Millisecond, fetch)
 	if err != nil {
 		t.Fatalf("expected success after transient errors, got: %v", err)
 	}
@@ -98,15 +85,157 @@ func TestWatchIgnoresTransientErrors(t *testing.T) {
 	}
 }
 
+// TestWatchPersistentFetchFailure verifies that a persistent fetch failure
+// (>= watchFetchFailureThreshold consecutive failed polls) stops the watch
+// with a fetch-failure error — the exit-1 path — instead of running to the
+// deadline and reporting a timeout (exit 2).
+func TestWatchPersistentFetchFailure(t *testing.T) {
+	calls := 0
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
+		calls++
+		return nil, errors.New("401: token expired")
+	}
+	_, polls, _, err := watch(context.Background(), []string{"a"}, 5*time.Second, 10*time.Millisecond, fetch)
+	if err == nil {
+		t.Fatal("expected a fetch-failure error, got nil")
+	}
+	if !errors.Is(err, errWatchFetchFailure) {
+		t.Fatalf("expected errWatchFetchFailure, got: %v", err)
+	}
+	if errors.Is(err, errWatchTimeout) {
+		t.Fatalf("persistent failure must not be reported as a timeout, got: %v", err)
+	}
+	if polls != 0 {
+		t.Fatalf("no poll may succeed while every fetch fails, got %d polls", polls)
+	}
+	if calls < watchFetchFailureThreshold {
+		t.Fatalf("expected at least %d failed polls, got %d", watchFetchFailureThreshold, calls)
+	}
+}
+
+// TestWatchBlockedFetchHonorsDeadline verifies the deadline is enforced
+// DURING a fetch: a fetch that blocks until its context is cancelled must
+// yield the timeout error well before the full timeout elapses, not keep
+// the watch alive past the deadline.
+func TestWatchBlockedFetchHonorsDeadline(t *testing.T) {
+	timeout := 400 * time.Millisecond
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	start := time.Now()
+	_, _, _, err := watch(context.Background(), []string{"a"}, timeout, 100*time.Millisecond, fetch)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if !errors.Is(err, errWatchTimeout) {
+		t.Fatalf("expected errWatchTimeout, got: %v", err)
+	}
+	if elapsed < timeout-50*time.Millisecond {
+		t.Fatalf("blocked fetch must be cancelled near the deadline, finished after %s (< %s): the deadline was not enforced during fetching", elapsed, timeout)
+	}
+}
+
+// TestWatchLateFetchAfterDeadline verifies the deadline is enforced during
+// fetching: a slow poll is cancelled at the deadline (a fetch error, so the
+// timeout path is reached without a persistent-failure threshold), and a
+// poll that returns fresh comments after the deadline must NOT be reported
+// as success.
+func TestWatchLateFetchAfterDeadline(t *testing.T) {
+	timeout := 150 * time.Millisecond
+
+	t.Run("slow poll cancelled at deadline", func(t *testing.T) {
+		fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
+			// A real backend (exec.CommandContext / NewRequestWithContext)
+			// aborts on ctx cancellation and returns an error.
+			select {
+			case <-time.After(250 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return nil, nil
+		}
+		_, _, _, err := watch(context.Background(), []string{"a"}, timeout, 50*time.Millisecond, fetch)
+		if err == nil {
+			t.Fatal("expected a timeout error for a cancelled poll, got nil")
+		}
+		if !errors.Is(err, errWatchTimeout) {
+			t.Fatalf("cancelled poll must be reported as a timeout, got: %v", err)
+		}
+	})
+
+	t.Run("late success is not success", func(t *testing.T) {
+		fetch := func(context.Context) ([]review.ParsedComment, error) {
+			// Defensive: a result that lands after the deadline must not be
+			// reported as success.
+			time.Sleep(250 * time.Millisecond)
+			return []review.ParsedComment{{ID: "a"}, {ID: "late-b"}}, nil
+		}
+		_, _, _, err := watch(context.Background(), []string{"a"}, timeout, 50*time.Millisecond, fetch)
+		if err == nil {
+			t.Fatal("a poll landing after the deadline must not be reported as success")
+		}
+		if !errors.Is(err, errWatchTimeout) {
+			t.Fatalf("late success must be reported as a timeout, got: %v", err)
+		}
+	})
+}
+
+// TestWatchIgnoresReopenedBaselineThread verifies the baseline contract
+// through the shared pipeline: a root that is resolved at start (hence
+// absent from the filtered polling set) is still captured in the pre-filter
+// baseline, so reopening it later does NOT trigger success.
+func TestWatchIgnoresReopenedBaselineThread(t *testing.T) {
+	// The baseline capture runs RelevantComments with baselineOut, exactly
+	// like main(): resolved root "a" is dropped from Comments but its ID is
+	// recorded in the baseline.
+	rawStart := []review.RawComment{
+		{ID: "a", Author: "alice", IsResolved: true},
+		{ID: "b", Author: "bob"},
+	}
+	baselineIDs := make([]string, 0)
+	base := review.RelevantComments(rawStart, review.RelevantOptions{}, &baselineIDs)
+	if len(base.Comments) != 1 || base.Comments[0].ID != "b" {
+		t.Fatalf("baseline filter must drop resolved root a, got %+v", base.Comments)
+	}
+	got := map[string]bool{}
+	for _, id := range baselineIDs {
+		got[id] = true
+	}
+	if !got["a"] || !got["b"] {
+		t.Fatalf("baseline must capture pre-filter roots a and b, got %v", baselineIDs)
+	}
+
+	// The poll later returns the thread with the resolved flag cleared.
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
+		res := review.RelevantComments([]review.RawComment{
+			{ID: "a", Author: "alice"},
+			{ID: "b", Author: "bob"},
+		}, review.RelevantOptions{}, nil)
+		return res.Comments, nil
+	}
+	fresh, _, _, err := watch(context.Background(), baselineIDs, 200*time.Millisecond, 10*time.Millisecond, fetch)
+	if err == nil {
+		t.Fatalf("reopened baseline thread must not trigger success, got comments %+v", fresh)
+	}
+	if !errors.Is(err, errWatchTimeout) {
+		t.Fatalf("expected a timeout, got: %v", err)
+	}
+	if fresh != nil {
+		t.Fatalf("expected no comments, got %+v", fresh)
+	}
+}
+
 // TestWatchBaselineIsFatal proves the baseline-diff semantics with a zero
 // baseline: the first poll's comments are all "new" and immediately trigger
 // success. (The baseline fetch itself lives in main()'s closure contract,
 // which is out of reach in-process.)
 func TestWatchBaselineIsFatal(t *testing.T) {
-	fetch := func() ([]review.ParsedComment, error) {
+	fetch := func(ctx context.Context) ([]review.ParsedComment, error) {
 		return []review.ParsedComment{{ID: "a"}}, nil
 	}
-	fresh, _, _, err := watch(nil, 2*time.Second, 10*time.Millisecond, fetch)
+	fresh, _, _, err := watch(context.Background(), nil, 2*time.Second, 10*time.Millisecond, fetch)
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
@@ -114,34 +243,6 @@ func TestWatchBaselineIsFatal(t *testing.T) {
 		t.Fatalf("expected the zero-baseline comment to be reported new, got %+v", fresh)
 	}
 }
-
-// TestSelectRelevant verifies the relevant-comment contract: root-only,
-// author filter, open, not outdated, self-excluded — in that order.
-func TestSelectRelevant(t *testing.T) {
-	raw := []review.RawComment{
-		{ID: "alice-root", Author: "alice"},
-		{ID: "bob-reply", Author: "bob", ReplyToID: strPtr("alice-root")},
-		{ID: "me-root", Author: "me"},
-		{ID: "carol-root", Author: "carol", IsResolved: true},
-		{ID: "dave-root", Author: "dave", IsOutdated: true},
-	}
-
-	// No author filter: alice is the only comment that survives root-only,
-	// resolved, outdated, and self filters.
-	got := selectRelevant(raw, nil, nil, "me")
-	if len(got) != 1 || got[0].ID != "alice-root" {
-		t.Fatalf("expected only alice's root comment, got %+v", got)
-	}
-
-	// Author filter to carol: her root is the only author match, but the
-	// resolved filter drops it, so the result is empty.
-	got = selectRelevant(raw, []string{"CAROL"}, nil, "me")
-	if len(got) != 0 {
-		t.Fatalf("expected no comments for resolved carol root, got %+v", got)
-	}
-}
-
-func strPtr(s string) *string { return &s }
 
 // TestParseHead verifies the positional PR-number / help seam: --help and -h
 // MUST short-circuit to help regardless of position or PR-number validity,
@@ -268,10 +369,33 @@ func buildWatchBinary(t *testing.T) string {
 }
 
 // runWatch runs the binary with the given args and reports exit status and
-// combined stdout+stderr.
-func runWatch(t *testing.T, bin string, args ...string) (int, string) {
+// combined stdout+stderr. When cwd is non-empty the subprocess runs there —
+// setup-failure cases use an empty directory with no git repository so the
+// git/fetch stage fails deterministically without live network access.
+// gitEnvFilter drops GIT_* variables so the subprocess cannot inherit a
+// git repository from the caller's environment (the pre-commit hook and
+// `go test` run with GIT_DIR/GIT_WORK_TREE set). This keeps the cwd-based
+// "no repository" cases deterministic regardless of how the suite is run.
+func gitEnvFilter() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if k, _, _ := strings.Cut(e, "="); strings.HasPrefix(k, "GIT_") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func runWatch(t *testing.T, bin, cwd string, args ...string) (int, string) {
 	t.Helper()
-	out, err := exec.Command(bin, args...).CombinedOutput()
+	cmd := exec.Command(bin, args...)
+	cmd.Env = gitEnvFilter()
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
 		var ee *exec.ExitError
@@ -284,14 +408,23 @@ func runWatch(t *testing.T, bin string, args ...string) (int, string) {
 	return code, string(out)
 }
 
+// TestFlagParseSubprocess drives the inline flag-parsing branches in main()
+// through the real binary: invalid durations, flag-shaped author values, and
+// poll >= timeout are rejected before any API call. The valid-args case runs
+// the binary from an empty temp dir (no git repository, no origin remote),
+// so it fails deterministically at the git-remote setup stage with
+// exit 1 — no live network access and no environment dependence.
 func TestFlagParseSubprocess(t *testing.T) {
 	bin := buildWatchBinary(t)
+	emptyDir := t.TempDir() // no .git, no origin remote
 
 	cases := []struct {
-		name         string
-		args         []string
-		wantCode     int
-		wantInOutput string // substring that MUST appear
+		name          string
+		args          []string
+		cwd           string
+		wantCode      int
+		wantInOutput  string // substring that MUST appear
+		wantNotOutput string // substring that MUST NOT appear
 	}{
 		{
 			name:         "timeout non-duration rejected",
@@ -323,15 +456,42 @@ func TestFlagParseSubprocess(t *testing.T) {
 			wantCode:     1,
 			wantInOutput: "Error: --authors requires a non-empty value",
 		},
+		{
+			name:         "poll equal to timeout rejected",
+			args:         []string{"42", "--poll", "10s", "--timeout", "10s"},
+			wantCode:     1,
+			wantInOutput: "--poll",
+		},
+		{
+			name:         "poll greater than timeout rejected",
+			args:         []string{"42", "--poll", "30s", "--timeout", "20s"},
+			wantCode:     1,
+			wantInOutput: "must be less than --timeout",
+		},
+		{
+			// Flag parsing succeeds; in a directory with no git repository
+			// the run MUST fail at the git-remote setup stage (exit 1) —
+			// deterministic, no network, and specific to the setup-failure
+			// path.
+			name:          "valid args fail at git remote stage",
+			args:          []string{"99999", "--timeout", "5s", "--poll", "1s"},
+			cwd:           emptyDir,
+			wantCode:      1,
+			wantInOutput:  "git remote",
+			wantNotOutput: "flag-shaped",
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			code, out := runWatch(t, bin, tt.args...)
+			code, out := runWatch(t, bin, tt.cwd, tt.args...)
 			if code != tt.wantCode {
 				t.Fatalf("exit code = %d, want %d; output:\n%s", code, tt.wantCode, out)
 			}
 			if tt.wantInOutput != "" && !strings.Contains(out, tt.wantInOutput) {
 				t.Fatalf("output must contain %q:\n%s", tt.wantInOutput, out)
+			}
+			if tt.wantNotOutput != "" && strings.Contains(out, tt.wantNotOutput) {
+				t.Fatalf("output must not contain %q:\n%s", tt.wantNotOutput, out)
 			}
 		})
 	}
