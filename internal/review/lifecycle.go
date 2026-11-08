@@ -35,6 +35,12 @@ const (
 	DefaultLifecyclePoll    = 30 * time.Second
 )
 
+// errRoundDeadline wraps an observation error caused by the round deadline
+// itself, as distinct from a request-local timeout inside one fetch. The
+// lifecycle maps only this sentinel to StatusTimeout; every other fetch
+// failure is a fatal error.
+var errRoundDeadline = errors.New("round deadline exceeded")
+
 // CollectedEvent is one event in the lifecycle result. It carries the raw
 // evidence (including body text) but is never executed as instructions.
 type CollectedEvent struct {
@@ -314,8 +320,11 @@ func RunLifecycle(cfg LifecycleConfig) (LifecycleResult, error) {
 	if consecutiveFailures >= 3 {
 		return finishError(result, cfg, start, fmt.Errorf("three consecutive PR observation failures: %w", observationErr))
 	}
-	if observationErr != nil && !errors.Is(observationErr, context.DeadlineExceeded) &&
-		!errors.Is(observationErr, context.Canceled) {
+	// Only an observation aborted by the round deadline itself is a timeout:
+	// the backends wrap such errors with errRoundDeadline. A request-local
+	// timeout (the per-request 30s budget) is an ordinary fetch error even if
+	// the round budget was also exhausted in the meantime.
+	if observationErr != nil && !errors.Is(observationErr, errRoundDeadline) {
 		return finishError(result, cfg, start, observationErr)
 	}
 	result.Status = StatusTimeout

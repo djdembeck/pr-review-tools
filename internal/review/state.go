@@ -98,6 +98,9 @@ func LoadState(path string) (*State, bool, error) {
 	if info.Mode().Perm()&0o022 != 0 {
 		return nil, false, &StateError{Path: path, Msg: fmt.Sprintf("has mode %04o; refusing a group/other-writable state file", info.Mode().Perm())}
 	}
+	if err := checkStateOwnership(path, info); err != nil {
+		return nil, false, err
+	}
 
 	payload, err := os.ReadFile(path)
 	if err != nil {
@@ -118,6 +121,10 @@ func LoadState(path string) (*State, bool, error) {
 	}
 	return &st, true, nil
 }
+
+// currentUID reports the uid of the running process. It is a variable, not a
+// direct call, so tests can force an owner mismatch without chowning a file.
+var currentUID = os.Getuid
 
 // ValidateBinding reports whether the loaded state belongs to the requested
 // round identity.

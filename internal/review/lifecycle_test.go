@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,6 +248,90 @@ esac
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("round did not cancel gh process")
+	}
+}
+
+// TestRequestTimeoutIsFetchErrorNotRoundTimeout proves the status decision is
+// keyed on the round deadline, not on the observation error chain: a request
+// that blows its own per-request budget (round budget intact) is a fetch
+// error, while exhausting the round deadline is a timeout.
+func TestRequestTimeoutIsFetchErrorNotRoundTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		failure error
+		// advance exhausts the round clock in the same observation as the
+		// fetch failure, so the clock state is a decoy: the sentinel in the
+		// error chain, not the clock, decides the status.
+		advance    bool
+		wantStatus string
+		wantErr    bool
+		wantPolls  int
+	}{
+		{
+			name:       "request-local deadline is a fetch error",
+			failure:    fmt.Errorf("gh request timed out after 30s: %w", context.DeadlineExceeded),
+			wantStatus: StatusError,
+			wantErr:    true,
+			wantPolls:  0,
+		},
+		{
+			name:       "request-local deadline with exhausted round clock is still a fetch error",
+			failure:    fmt.Errorf("gh request timed out after 30s: %w", context.DeadlineExceeded),
+			advance:    true,
+			wantStatus: StatusError,
+			wantErr:    true,
+			wantPolls:  0,
+		},
+		{
+			name:       "request-local cancellation is a fetch error",
+			failure:    fmt.Errorf("gh request canceled: %w", context.Canceled),
+			wantStatus: StatusError,
+			wantErr:    true,
+			wantPolls:  0,
+		},
+		{
+			name:       "round deadline exhaustion is a timeout",
+			wantStatus: StatusTimeout,
+			wantPolls:  1, // the successful baseline poll before the budget ran out
+		},
+		{
+			name: "round-abort wrapped by the backend is a timeout",
+			failure: fmt.Errorf("aborted: %w", fmt.Errorf("%w: %w",
+				context.DeadlineExceeded, errRoundDeadline)),
+			wantStatus: StatusTimeout,
+			wantErr:    false,
+			wantPolls:  0,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &fakeBackend{}
+			cfg, clock, _ := newTestConfig(t, b, "alice")
+			cfg.Timeout = time.Minute
+			if tt.failure != nil {
+				b.onEvents = func(context.Context) error {
+					if tt.advance {
+						clock.now = clock.now.Add(cfg.Timeout)
+					}
+					return tt.failure
+				}
+			} else {
+				// Let the fake clock run out the round budget without any
+				// fetch failure: a pure deadline exhaustion.
+				cfg.Poll = time.Minute
+				_ = clock
+			}
+			result, err := RunLifecycle(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if result.Status != tt.wantStatus {
+				t.Fatalf("status = %q, want %q (result=%+v)", result.Status, tt.wantStatus, result)
+			}
+			if result.Polls != tt.wantPolls {
+				t.Fatalf("polls = %d, want %d", result.Polls, tt.wantPolls)
+			}
+		})
 	}
 }
 
@@ -1100,6 +1185,69 @@ func TestStateRefusesSymlink(t *testing.T) {
 	}
 	if _, _, err := LoadState(link); err == nil {
 		t.Fatal("a symlinked state path must be refused")
+	}
+}
+
+// TestStateRefusesOtherUserOwnedFile proves a state file written by another
+// user is refused even with a correct mode, so a cursor cannot be planted by
+// a co-tenant of the host.
+func TestStateRefusesOtherUserOwnedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	st := NewState(StateBinding{
+		Platform: PlatformGitHub, Repo: "owner/repo", PR: 1, Head: testHead,
+		WaitFor: WaitForAll, Authors: []string{"alice"},
+	}, nil, now)
+	st.BaselineComplete = true
+	if err := SaveState(path, st, now); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if os.Getuid() == 0 {
+		// Root can chown to anyone; never chown to itself.
+		if err := os.Chown(path, 1, os.Getgid()); err != nil {
+			t.Skipf("cannot chown to another uid as root: %v", err)
+		}
+	} else if err := os.Chown(path, 0, os.Getgid()); err != nil {
+		t.Skipf("cannot chown to another uid on this host: %v", err)
+	}
+	_, _, err := LoadState(path)
+	if err == nil {
+		t.Fatal("a state file owned by another user must be refused")
+	}
+	var se *StateError
+	if !errors.As(err, &se) {
+		t.Fatalf("want StateError, got %T: %v", err, err)
+	}
+}
+
+// TestStateOwnershipMismatchIsFatal forces a uid mismatch through the
+// currentUID seam, so the foreign-owner refusal is exercised unconditionally
+// on any host, independent of chown availability.
+func TestStateOwnershipMismatchIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	st := NewState(StateBinding{
+		Platform: PlatformGitHub, Repo: "owner/repo", PR: 1, Head: testHead,
+		WaitFor: WaitForAll, Authors: []string{"alice"},
+	}, nil, now)
+	st.BaselineComplete = true
+	if err := SaveState(path, st, now); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	uid := currentUID()
+	currentUID = func() int { return uid + 1 }
+	t.Cleanup(func() { currentUID = os.Getuid })
+
+	_, _, err := LoadState(path)
+	if err == nil {
+		t.Fatal("a state file whose owner does not match the current uid must be refused")
+	}
+	var se *StateError
+	if !errors.As(err, &se) {
+		t.Fatalf("want StateError, got %T: %v", err, err)
 	}
 }
 

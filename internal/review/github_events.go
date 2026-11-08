@@ -95,6 +95,7 @@ func runGhWithTimeout(ctx context.Context, args []string, timeout time.Duration)
 	if timeout <= 0 {
 		timeout = DefaultRequestTimeout
 	}
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -104,7 +105,16 @@ func runGhWithTimeout(ctx context.Context, args []string, timeout time.Duration)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// A WithTimeout child reports the parent's deadline as its own
+		// DeadlineExceeded, so the parent context, not the child, decides
+		// which deadline fired: a done parent means the round budget expired
+		// mid-request (a round abort, mapped to a timeout), while an alive
+		// parent with a done child means the request-local budget expired
+		// (an ordinary fetch failure).
 		if ctx.Err() == context.DeadlineExceeded {
+			if parentCtx.Err() != nil {
+				return "", fmt.Errorf("gh request aborted by round deadline: %w: %w", parentCtx.Err(), errRoundDeadline)
+			}
 			return "", fmt.Errorf("gh request timed out after %s: %w", timeout, ctx.Err())
 		}
 		if ctx.Err() != nil {
@@ -205,7 +215,9 @@ func (b githubEventBackend) Events(ctx context.Context) ([]Event, error) {
 // default.
 func (b githubEventBackend) run(ctx context.Context, args []string) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		// The round context ended before this request even started: mark a
+		// round-deadline abort, distinct from a request-local timeout.
+		return "", fmt.Errorf("%w: %w", err, errRoundDeadline)
 	}
 	timeout := b.timeout
 	if timeout <= 0 {

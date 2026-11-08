@@ -83,16 +83,28 @@ type forgejoEventBackend struct {
 // get executes a bounded Forgejo GET through the test seam or package default.
 func (b forgejoEventBackend) get(ctx context.Context, endpoint string) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		// The round context ended before this request even started: mark a
+		// round-deadline abort, distinct from a request-local timeout.
+		return "", fmt.Errorf("%w: %w", err, errRoundDeadline)
 	}
 	timeout := b.timeout
 	if timeout <= 0 {
 		timeout = DefaultRequestTimeout
 	}
+	var raw string
+	var err error
 	if b.getFn != nil {
-		return b.getFn(ctx, endpoint, timeout)
+		raw, err = b.getFn(ctx, endpoint, timeout)
+	} else {
+		raw, err = forgejoEventGet(ctx, endpoint, timeout)
 	}
-	return forgejoEventGet(ctx, endpoint, timeout)
+	// The request timeout is enforced by the client, not a context deadline,
+	// so any context error here is the round ending mid-request, not the
+	// request-local budget.
+	if err != nil && ctx.Err() != nil {
+		return "", fmt.Errorf("%w: %w", err, errRoundDeadline)
+	}
+	return raw, err
 }
 
 // forgejoEventPR is the subset of a Forgejo pull request used for snapshots.

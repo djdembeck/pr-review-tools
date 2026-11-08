@@ -196,7 +196,7 @@ Pending and dismissed reviews never count. Inline comments are collected as evid
 
 - The baseline is captured and durably saved **before** the first wait proceeds; the tool prints `review-watch: armed` on stderr only after that save. Start CI (or any other head-moving work) on that marker, not before.
 - A timeout saves progress and exits `2`. Resuming the same `--state` does not rebaseline, so events that landed while no watcher was running — including during a CI repair — still count.
-- A malformed, symlinked, group/other-writable, wrong-version, or differently-bound state file is a hard error (exit `1`). The file is never silently reset or rewritten. To start watching a new head, use a **new** state path per round, e.g. `round-<n>-<head7>.json`.
+- A malformed, symlinked, group/other-writable, foreign-owner, wrong-version, or differently-bound state file is a hard error (exit `1`). The file is never silently reset or rewritten. To start watching a new head, use a **new** state path per round, e.g. `round-<n>-<head7>.json`.
 - The head is read before and after every event fetch. Events collected across a head move are discarded rather than credited to the old head, and the round ends as `head-changed`.
 - Transient API failures are retried with the cursor intact; three consecutive failed observations stop with error (`1`), rather than waiting out missing CLI/authentication setup. A round with only API failures also reports error, not missing reviews.
 - `--timeout` bounds the whole round, including in-flight paginated HTTP/CLI reads. Deadline-expired observations never report ready. `observedHead` reports the last successfully read head, including on ready, timeout, and later errors.
