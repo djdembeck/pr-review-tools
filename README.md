@@ -6,9 +6,9 @@
 
 Close the PR-review loop on GitHub or Forgejo with zero Go dependencies, for reviews from ANY reviewer — bots or humans.
 
-pr-review-tools provides two standalone Go binaries for AI agent workflows and developers who process PR reviews programmatically. The parser turns review comments into structured JSON or a consensus markdown summary; the reply tool posts custom per-comment replies or Mira-bot reject/acknowledge feedback, including batch operations, and resolves review threads on GitHub. The feedback loop is deterministic and does not require an LLM per interaction.
+pr-review-tools provides three standalone Go binaries for AI agent workflows and developers who process PR reviews programmatically. The parser turns review comments into structured JSON or a consensus markdown summary; the reply tool posts custom per-comment replies or Mira-bot reject/acknowledge feedback, including batch operations, and resolves review threads on GitHub; the watch tool persistently polls a PR and exits as soon as a new review comment appears, so agent workflows can block on reviewers instead of polling manually. The feedback loop is deterministic and does not require an LLM per interaction.
 
-The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. If it cannot determine who *you* are, the parser fails with an error rather than passing everything through unfiltered (opt out explicitly with `--include-self`). It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. Both binaries are pure standard-library Go, so there are no external Go dependencies to download.
+The default relevance contract for the parser: **root comments that are open, not outdated, and not authored by you** — from every reviewer. If it cannot determine who *you* are, the parser fails with an error rather than passing everything through unfiltered (opt out explicitly with `--include-self`). It auto-detects GitHub or Forgejo from the repository's `origin` remote. GitHub uses the `gh` CLI; Forgejo uses its REST API and environment variables. All binaries are pure standard-library Go, so there are no external Go dependencies to download.
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ The default relevance contract for the parser: **root comments that are open, no
 
 Reviewers post comments on PRs — automation bots like [Mira](https://github.com/mira-reviewer/mira) or `nimuebot`, and human reviewers — but there is no programmatic way for AI agent workflows (like `/fixup`) to see only the feedback that still matters and communicate back which findings were addressed and which were dismissed. This repo closes that loop: the parser extracts the relevant comments (filtering out resolved, outdated, and your own replies), and the reply tool posts a short custom note per comment and resolves the thread so it stays closed. Mira-authored comments additionally support the `@bot-name reject — <reason>` / acknowledge templates that feed Mira's learning loop.
 
-The two-binary design separates parsing from acting: `pr-review-parser` extracts review data, and `pr-review-reply` posts the feedback. Together they provide a parse-then-act pipeline for teams that need to process many findings without replying manually to every comment.
+The design separates parsing, acting, and waiting: `pr-review-parser` extracts review data, `pr-review-reply` posts the feedback, and `pr-review-watch` blocks until a reviewer posts new comments. Together they provide a parse-then-act pipeline for teams that need to process many findings without replying manually to every comment.
 
 ## Install / Running
 
@@ -45,13 +45,14 @@ From the repository root:
 make build
 ```
 
-This creates `bin/pr-review-parser` and `bin/pr-review-reply`. Set the credentials for the platform selected by the current repository's remote before running either binary.
+This creates `bin/pr-review-parser`, `bin/pr-review-reply`, and `bin/pr-review-watch`. Set the credentials for the platform selected by the current repository's remote before running any binary.
 
 If you prefer Go's module install path, it also compiles the commands locally and places them in `$GOPATH/bin` (normally `~/go/bin`):
 
 ```bash
 go install github.com/djdembeck/pr-review-tools/cmd/pr-review-parser@latest
 go install github.com/djdembeck/pr-review-tools/cmd/pr-review-reply@latest
+go install github.com/djdembeck/pr-review-tools/cmd/pr-review-watch@latest
 ```
 
 Make sure `$GOPATH/bin` is on your `$PATH`. Re-run those commands to update; there is no automatic update mechanism. See [GitHub Releases](https://github.com/djdembeck/pr-review-tools/releases) for changelogs.
@@ -70,7 +71,7 @@ go install github.com/djdembeck/pr-review-tools/cmd/pr-review-reply@v1.0.0
 
 ## Usage
 
-The examples below use the binaries produced by `make build`. If you used `go install`, invoke `pr-review-parser` and `pr-review-reply` without the `bin/` prefix. Run the commands from a checkout of the PR repository so the tools can inspect `git remote get-url origin`.
+The examples below use the binaries produced by `make build`. If you used `go install`, invoke `pr-review-parser`, `pr-review-reply`, and `pr-review-watch` without the `bin/` prefix. Run the commands from a checkout of the PR repository so the tools can inspect `git remote get-url origin`.
 
 ### Parsing
 
@@ -107,6 +108,101 @@ bin/pr-review-parser 123 --since-last-push     # comments after the upstream tra
 bin/pr-review-parser 123 --since-last-commit   # comments after HEAD
 bin/pr-review-parser 123 --since abc123        # comments after any git ref, or an RFC3339 timestamp
 ```
+
+### Watching
+
+Block until a reviewer posts: the watch tool persistently polls the PR and exits as soon as a **new** review comment appears.
+
+```bash
+bin/pr-review-watch 123                 # default: 15m timeout, 30s poll, all reviewers
+bin/pr-review-watch 123 --timeout 5m --poll 10s --authors miracodeai-bot,nimuebot
+```
+
+Exit codes: `0` = new review comment found (emitted as JSON, or consensus markdown with `--format consensus`, on stdout); `1` = usage/setup/fetch error; `2` = timed out.
+
+Baseline semantics: the first fetch captures the currently relevant comments (open, not outdated, non-self root comments — the same contract as the parser), keyed by comment ID. Only comments that appear **after** the watch starts count; pre-existing comments do not trigger success. New root comments trigger; a reply inside an existing thread does not. Transient poll errors (e.g. a network blip) are logged to stderr and the watch keeps polling until the deadline; a baseline fetch failure is fatal.
+
+#### Lifecycle mode: durable, head-bound reviewer waits
+
+The mode above answers "did a new comment appear?". An orchestrator that must wait for **named** reviewers on a **specific commit** — and survive a CI repair that moves the head, a restart, or a gap between two waits — needs lifecycle mode. It is opt-in with `--events`; without it every flag, output, and exit code above is unchanged.
+
+```bash
+bin/pr-review-watch 123 \
+  --events \
+  --state .git/pr-review/round-1-abc1234.json \
+  --head 1234abcd…full-sha \
+  --repo owner/repo \
+  --authors miracodeai-bot,nimuebot \
+  --timeout 30m --poll 30s
+```
+
+`--state`, `--head`, `--repo`, and `--authors` are required. `--wait-for all|any` defaults to `all`; `any` is an explicit opt-in. `--trusted-authors` stays a **separate** trust list for agent prompts and is never implied by `--authors`. Authors are matched by exact, case-insensitive login; there is no substring or `*bot` matching. Defaults in this mode are a 30m total wait and a 30s poll; each network request also has its own 30s deadline.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | `ready` — the wait condition was satisfied |
+| `1` | setup, fetch, or state error (including a rejected state file) |
+| `2` | `timeout` — the deadline passed; progress is preserved |
+| `3` | `head-changed` — the PR head is no longer the requested `--head` |
+| `4` | `closed` — the PR is closed or merged |
+
+stdout is a single versioned JSON object, printed in every outcome (including error and timeout). stderr carries progress and diagnostics:
+
+```json
+{
+  "version": 1,
+  "status": "ready",
+  "platform": "github",
+  "repo": "owner/repo",
+  "pr": 123,
+  "head": "1234abcd…",
+  "observedHead": "1234abcd…",
+  "statePath": ".git/pr-review/round-1-abc1234.json",
+  "waitFor": "all",
+  "authors": ["miracodeai-bot", "nimuebot"],
+  "responded": ["miracodeai-bot", "nimuebot"],
+  "outstanding": [],
+  "events": [
+    {
+      "id": "PRR_kwDO…",
+      "kind": "review",
+      "author": "miracodeai-bot",
+      "state": "COMMENTED",
+      "commitId": "1234abcd…",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "url": "https://…",
+      "binding": "commit",
+      "baseline": false,
+      "body": "…"
+    }
+  ],
+  "baselineEvents": 0,
+  "polls": 2,
+  "elapsedMs": 31000
+}
+```
+
+**What counts as a response.** `all` is satisfied only when every selected author has either a submitted review whose commit equals `--head`, or a top-level PR conversation comment first observed **after** the baseline. Event kinds are `review`, `review_comment` (an inline root comment), and `issue_comment`. `binding` records the evidence quality:
+
+- `commit` — a submitted review explicitly tied to `--head`. The commit is the proof, so a review already present at the baseline still counts.
+- `stable-head` — a top-level comment first seen as new between two identical head snapshots. This is temporal evidence: it is **never** claimed to be commit-bound, because the platform gives top-level comments no commit. This is how a bot that only publishes a summary can satisfy the wait.
+- `none` — no current-head binding: stale review commits, inline comments, and anything captured in the baseline.
+
+Pending and dismissed reviews never count. Inline comments are collected as evidence but never complete an author — one comment in a multi-comment review does not prove the review finished. Approval state, CI status, and thread resolution are **not** readiness. Comment bodies are stored verbatim and never executed.
+
+**Durability and resume.** The state file is the cursor: it binds to platform, repository, PR, head, `--authors`, and `--wait-for`, and it stores collected events, seen IDs, and the poll count. It is written atomically (temp file, fsync, rename) with mode `0600`, and contains no tokens or headers.
+
+- The baseline is captured and durably saved **before** the first wait proceeds; the tool prints `review-watch: armed` on stderr only after that save. Start CI (or any other head-moving work) on that marker, not before.
+- A timeout saves progress and exits `2`. Resuming the same `--state` does not rebaseline, so events that landed while no watcher was running — including during a CI repair — still count.
+- A malformed, symlinked, group/other-writable, foreign-owner, wrong-version, or differently-bound state file is a hard error (exit `1`). The file is never silently reset or rewritten. To start watching a new head, use a **new** state path per round, e.g. `round-<n>-<head7>.json`.
+- The head is read before and after every event fetch. Events collected across a head move are discarded rather than credited to the old head, and the round ends as `head-changed`.
+- Transient API failures are retried with the cursor intact; three consecutive failed observations stop with error (`1`), rather than waiting out missing CLI/authentication setup. A round with only API failures also reports error, not missing reviews.
+- `--timeout` bounds the whole round, including in-flight paginated HTTP/CLI reads. Deadline-expired observations never report ready. `observedHead` reports the last successfully read head, including on ready, timeout, and later errors.
+- Forgejo review and conversation pagination continues until an empty page, even when the server clamps the requested page size. Hitting the 50-page safety cap is an incomplete-observation error, never partial readiness.
+
+On GitHub this mode uses the `gh` CLI (GraphQL for head state, reviews, and review threads; the REST paginated issue-comment endpoint). On Forgejo it uses the REST API with `FORGEJO_URL`/`FORGEJO_TOKEN`, reading review `state`/`dismissed`/`commit_id`/`submitted_at`, per-review inline comments, and top-level issue comments. `--repo` selects the receiving repository; the platform is still detected from the `origin` remote, so a watch cannot be redirected to another host by the flag. All subprocess calls use argument vectors, never shell strings.
 
 ### Replied to every reviewer
 
@@ -218,7 +314,7 @@ The reply tool accepts `--format json` for reply results. Successful or failed r
 
 ## Building
 
-`make build` builds both commands:
+`make build` builds all three commands:
 
 ```bash
 make build
@@ -229,6 +325,7 @@ The equivalent direct commands are:
 ```bash
 go build -o bin/pr-review-parser ./cmd/pr-review-parser
 go build -o bin/pr-review-reply ./cmd/pr-review-reply
+go build -o bin/pr-review-watch ./cmd/pr-review-watch
 ```
 
 The repository has no external Go dependencies. For local checks, use:

@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -70,22 +71,25 @@ const GITHUB_THREAD_COMMENTS_QUERY = `query($threadId: ID!, $after: String) {
 }`
 
 // ghRun executes the gh CLI. Overridable in tests to avoid shelling out.
-var ghRun func(args []string) (string, error) = runGh
+// ctx bounds the gh process's lifetime so a blocked fetch honors a caller
+// deadline.
+var ghRun func(ctx context.Context, args []string) (string, error) = runGh
 
 // ghRunMu protects ghRun from concurrent reads/writes.
 var ghRunMu sync.RWMutex
 
 // ghRunGuarded executes the gh CLI through the overridable ghRun seam.
-func ghRunGuarded(args []string) (string, error) {
+func ghRunGuarded(ctx context.Context, args []string) (string, error) {
 	ghRunMu.RLock()
 	defer ghRunMu.RUnlock()
-	return ghRun(args)
+	return ghRun(ctx, args)
 }
 
 // runGh executes the gh CLI with the given args and returns trimmed stdout. A
-// non-zero exit produces an error carrying stderr.
-func runGh(args []string) (string, error) {
-	cmd := exec.Command("gh", args...)
+// non-zero exit produces an error carrying stderr. ctx cancellation kills
+// the gh process; its reported error is context.Canceled / context.DeadlineExceeded.
+func runGh(ctx context.Context, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", args...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -103,7 +107,7 @@ func runGh(args []string) (string, error) {
 // the gh CLI GraphQL endpoint, fully paginating both the reviewThreads
 // connection (100 per page) and each thread's comments connection (50 per
 // page), and normalizes the accumulated comments into RawComment values.
-func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error) {
+func FetchGitHubComments(ctx context.Context, owner, repo string, prNumber int) ([]RawComment, error) {
 	var threads []ghThread
 	cursor := ""
 	for {
@@ -117,7 +121,7 @@ func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error)
 		if cursor != "" {
 			args = append(args, "-F", "after="+cursor)
 		}
-		output, err := ghRunGuarded(args)
+		output, err := ghRunGuarded(ctx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -145,7 +149,7 @@ func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error)
 				"-F", "threadId=" + threads[i].ID,
 				"-F", "after=" + pageInfo.EndCursor,
 			}
-			output, err := ghRunGuarded(args)
+			output, err := ghRunGuarded(ctx, args)
 			if err != nil {
 				return nil, err
 			}
@@ -298,11 +302,11 @@ func mapThreadsToRawComments(threads []ghThread) []RawComment {
 // PostGitHubReply posts a reply to a review comment via the gh CLI REST API.
 // When dryRun is true, no API call is made and the intended body is printed to
 // stderr by the caller flow.
-func PostGitHubReply(owner, repo string, prNumber int, commentID, body string, dryRun bool) (ReplyResult, error) {
+func PostGitHubReply(ctx context.Context, owner, repo string, prNumber int, commentID, body string, dryRun bool) (ReplyResult, error) {
 	if dryRun {
 		return ReplyResult{Success: true}, nil
 	}
-	output, err := ghRunGuarded([]string{
+	output, err := ghRunGuarded(ctx, []string{
 		"api", "-X", "POST",
 		fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%s/replies", owner, repo, prNumber, commentID),
 		"-f", "body=" + body,
@@ -325,7 +329,7 @@ func PostGitHubReply(owner, repo string, prNumber int, commentID, body string, d
 // is still found; it stops early at the first Mira-authored thread, so a
 // match on the first page never triggers further fetches. Falls back to
 // "miracodeai-bot" when no Mira-authored comment is found or the query fails.
-func DetectGitHubBotName(owner, repo string, prNumber int) (string, error) {
+func DetectGitHubBotName(ctx context.Context, owner, repo string, prNumber int) (string, error) {
 	const query = `query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
@@ -354,7 +358,7 @@ func DetectGitHubBotName(owner, repo string, prNumber int) (string, error) {
 		if cursor != "" {
 			args = append(args, "-F", "after="+cursor)
 		}
-		output, err := ghRunGuarded(args)
+		output, err := ghRunGuarded(ctx, args)
 		if err != nil {
 			return "miracodeai-bot", nil
 		}
@@ -406,11 +410,11 @@ func FindThreadID(comments []RawComment, commentID string) (string, bool) {
 // gh CLI GraphQL endpoint. When dryRun is true, no API call is made. GraphQL
 // errors are reported as a failed ReplyResult with a nil error, mirroring
 // PostGitHubReply.
-func ResolveGitHubThread(owner, repo string, prNumber int, threadID string, dryRun bool) (ReplyResult, error) {
+func ResolveGitHubThread(ctx context.Context, owner, repo string, prNumber int, threadID string, dryRun bool) (ReplyResult, error) {
 	if dryRun {
 		return ReplyResult{Success: true}, nil
 	}
-	output, err := ghRunGuarded([]string{
+	output, err := ghRunGuarded(ctx, []string{
 		"api", "graphql",
 		"-f", "query=" + GITHUB_RESOLVE_MUTATION,
 		"-F", "threadId=" + threadID,

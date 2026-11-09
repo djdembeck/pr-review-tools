@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -79,7 +80,7 @@ func TestForgejoTryReplySucceedsOnFirstAttempt(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	result, testErr := forgejoTryReply("owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
+	result, testErr := forgejoTryReply(context.Background(), "owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -128,7 +129,7 @@ func TestForgejoTryReplyFallsBackToThreadedReviewComment(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	result, testErr := forgejoTryReply("owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
+	result, testErr := forgejoTryReply(context.Background(), "owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -174,7 +175,7 @@ func TestForgejoTryReplyFallsBackToIssueComment(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	result, testErr := forgejoTryReply("owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
+	result, testErr := forgejoTryReply(context.Background(), "owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), Position: 513})
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -225,7 +226,7 @@ func TestForgejoTryReplySkipsStrategy2WithEmptyParent(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	result, testErr := forgejoTryReply("owner", "repo", 42, "100", "test reply", "50", forgejoComment{})
+	result, testErr := forgejoTryReply(context.Background(), "owner", "repo", 42, "100", "test reply", "50", forgejoComment{})
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -272,7 +273,7 @@ func TestForgejoTryReplyWithOriginalPositionOnly(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	result, testErr := forgejoTryReply("owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), OriginalPosition: 400})
+	result, testErr := forgejoTryReply(context.Background(), "owner", "repo", 42, "100", "test reply", "50", forgejoComment{Path: stringPtr("f.go"), OriginalPosition: 400})
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -343,7 +344,7 @@ func TestPostForgejoReplyDryRun(t *testing.T) {
 	setTestEnv(t, srv)
 
 	dryRun := true
-	result, err := PostForgejoReply("owner", "repo", 42, "100", "body", dryRun)
+	result, err := PostForgejoReply(context.Background(), "owner", "repo", 42, "100", "body", dryRun)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -384,7 +385,7 @@ func TestFindForgejoReviewIDForCommentFound(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	id, parent, testErr := findForgejoReviewIDForComment("owner", "repo", 42, "100")
+	id, parent, testErr := findForgejoReviewIDForComment(context.Background(), "owner", "repo", 42, "100")
 	err.check(t)
 	if testErr != nil {
 		t.Fatalf("unexpected error: %v", testErr)
@@ -424,7 +425,7 @@ func TestFindForgejoReviewIDForCommentNotFound(t *testing.T) {
 
 	setTestEnv(t, srv)
 
-	_, _, testErr := findForgejoReviewIDForComment("owner", "repo", 42, "9999")
+	_, _, testErr := findForgejoReviewIDForComment(context.Background(), "owner", "repo", 42, "9999")
 	err.check(t)
 	if testErr == nil {
 		t.Fatal("expected error when comment not found")

@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -156,6 +157,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
 	remote, err := review.GetGitRemote()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -170,12 +172,27 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "- Detecting %s repo: %s/%s\n", platform, owner, repo)
 
+	// Self-exclusion is fail-closed: if the login cannot be determined,
+	// error out (with a pointer at --include-self) instead of silently
+	// passing comments through unfiltered — on Forgejo, replies resurface
+	// as roots, so an unfiltered set would include the agent's own
+	// comments. Users who intentionally want unfiltered output opt in
+	// explicitly with --include-self.
+	var selfLogin string
+	if !includeSelf {
+		selfLogin, err = review.ResolveSelfLogin(ctx, platform)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	var rawComments []review.RawComment
 	switch platform {
 	case review.PlatformGitHub:
-		rawComments, err = review.FetchGitHubComments(owner, repo, prNumber)
+		rawComments, err = review.FetchGitHubComments(ctx, owner, repo, prNumber)
 	case review.PlatformForgejo:
-		rawComments, err = review.FetchForgejoComments(owner, repo, prNumber)
+		rawComments, err = review.FetchForgejoComments(ctx, owner, repo, prNumber)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching comments: %v\n", err)
@@ -184,44 +201,16 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "- Fetched %d total review comments\n", len(rawComments))
 
-	roots := review.FilterRootComments(rawComments, authors...)
-	fmt.Fprintf(os.Stderr, "- Found %d review root comments\n", len(roots))
-
-	parsed := make([]review.ParsedComment, 0, len(roots))
-	for _, c := range roots {
-		parsed = append(parsed, review.ParseCommentTrusted(c, trustedAuthors))
-	}
-
-	if !includeResolved {
-		open := make([]review.ParsedComment, 0, len(parsed))
-		for _, c := range parsed {
-			if !c.IsResolved {
-				open = append(open, c)
-			}
-		}
-		parsed = open
-		fmt.Fprintf(os.Stderr, "- After filtering resolved: %d open comments\n", len(parsed))
-	}
-
-	if !includeOutdated {
-		current := make([]review.ParsedComment, 0, len(parsed))
-		for _, c := range parsed {
-			if !c.IsOutdated {
-				current = append(current, c)
-			}
-		}
-		parsed = current
-		fmt.Fprintf(os.Stderr, "- After filtering outdated: %d current comments\n", len(parsed))
-	}
-
-	if !includeSelf {
-		var err error
-		parsed, err = excludeSelf(parsed, platform)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-	}
+	// The shared relevance pipeline (internal/review) owns the root/author,
+	// resolved, outdated, and self stages; no baseline capture here.
+	res := review.RelevantComments(rawComments, review.RelevantOptions{
+		Authors:         authors,
+		TrustedAuthors:  trustedAuthors,
+		IncludeResolved: includeResolved,
+		IncludeOutdated: includeOutdated,
+		SelfLogin:       selfLogin,
+	}, nil)
+	parsed := res.Comments
 
 	if sinceCount == 1 {
 		var since time.Time
@@ -280,63 +269,10 @@ func parseHead(args []string) (int, bool, string) {
 	return prNumber, false, ""
 }
 
-// parseCSVLogins splits a comma-separated author login list into trimmed
-// non-empty logins. GitHub/Forgejo logins cannot start with "-", so reject
-// "--"-prefixed tokens to catch misplaced flags.
+// parseCSVLogins is a thin wrapper over the shared review.ParseCSVLogins
+// contract (one site owns the parsing rules).
 func parseCSVLogins(flag, val string) []string {
-	if strings.HasPrefix(val, "--") {
-		fmt.Fprintf(os.Stderr, "Error: %s got flag-shaped value '%s', expected CSV of logins\n", flag, val)
-		os.Exit(1)
-	}
-	var out []string
-	for _, a := range strings.Split(val, ",") {
-		if a = strings.TrimSpace(a); a != "" {
-			if strings.HasPrefix(a, "--") {
-				fmt.Fprintf(os.Stderr, "Error: %s got flag-shaped login '%s', expected login\n", flag, a)
-				os.Exit(1)
-			}
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
-// selfLoginFunc resolves the authenticated login; a seam so tests can stub
-// review.SelfLogin without hitting gh or the Forgejo API.
-var selfLoginFunc = review.SelfLogin
-
-// excludeSelf drops parsed comments authored by the authenticated user. It
-// fails closed: if the login cannot be determined, it returns an error
-// instead of silently passing comments through unfiltered — on Forgejo,
-// replies resurface as roots, so an unfiltered set would include the
-// agent's own comments. Users who intentionally want unfiltered output opt
-// in explicitly with --include-self.
-func excludeSelf(comments []review.ParsedComment, platform review.Platform) ([]review.ParsedComment, error) {
-	selfLogin, err := selfLoginFunc(platform)
-	if err != nil {
-		return nil, fmt.Errorf("could not determine authenticated user: %w (pass --include-self to skip self-comment exclusion)", err)
-	}
-	if selfLogin == "" {
-		return nil, fmt.Errorf("could not determine authenticated user (empty login) (pass --include-self to skip self-comment exclusion)")
-	}
-	before := len(comments)
-	filtered := filterOutSelf(comments, selfLogin)
-	if removed := before - len(filtered); removed > 0 {
-		fmt.Fprintf(os.Stderr, "- Excluded %d self-authored comment(s) (author: %s)\n", removed, selfLogin)
-	}
-	return filtered, nil
-}
-
-// filterOutSelf drops parsed comments authored by selfLogin (case-insensitive).
-func filterOutSelf(comments []review.ParsedComment, selfLogin string) []review.ParsedComment {
-	out := make([]review.ParsedComment, 0, len(comments))
-	for _, c := range comments {
-		if strings.EqualFold(c.Author, selfLogin) {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
+	return review.ParseCSVLogins(flag, val)
 }
 
 // filterSinceParsed keeps parsed comments created strictly after since.
