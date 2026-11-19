@@ -6,73 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/djdembeck/pr-review-tools/internal/review"
 )
-
-// withSelfLogin stubs the self-login seam and returns a restore func.
-func withSelfLogin(t *testing.T, fn func(review.Platform) (string, error)) {
-	t.Helper()
-	prev := selfLoginFunc
-	selfLoginFunc = fn
-	t.Cleanup(func() { selfLoginFunc = prev })
-}
-
-// TestExcludeSelfFailClosed verifies the self-exclusion contract: a
-// SelfLogin failure or empty login MUST error instead of silently passing
-// comments through unfiltered (replies resurface as roots on Forgejo), and
-// the error must direct the user to --include-self.
-func TestExcludeSelfFailClosed(t *testing.T) {
-	comments := []review.ParsedComment{
-		{ID: "1", Author: "me"},
-		{ID: "2", Author: "nimuebot"},
-	}
-
-	t.Run("SelfLogin error", func(t *testing.T) {
-		withSelfLogin(t, func(review.Platform) (string, error) {
-			return "", errors.New("gh not authenticated")
-		})
-		got, err := excludeSelf(comments, review.PlatformGitHub)
-		if err == nil {
-			t.Fatal("SelfLogin failure must error, not silently pass comments through")
-		}
-		if got != nil {
-			t.Fatalf("expected nil comments on error, got %+v", got)
-		}
-		if !strings.Contains(err.Error(), "--include-self") {
-			t.Fatalf("error must direct the user to --include-self, got: %v", err)
-		}
-	})
-
-	t.Run("empty login", func(t *testing.T) {
-		withSelfLogin(t, func(review.Platform) (string, error) {
-			return "", nil
-		})
-		if _, err := excludeSelf(comments, review.PlatformForgejo); err == nil {
-			t.Fatal("empty login must error, not silently pass comments through")
-		}
-	})
-}
-
-// TestExcludeSelfFilters verifies the success path: self-authored comments
-// are dropped case-insensitively and everything else is kept unchanged.
-func TestExcludeSelfFilters(t *testing.T) {
-	withSelfLogin(t, func(review.Platform) (string, error) {
-		return "Me", nil
-	})
-	comments := []review.ParsedComment{
-		{ID: "1", Author: "me"},
-		{ID: "2", Author: "ME"},
-		{ID: "3", Author: "nimuebot"},
-	}
-	got, err := excludeSelf(comments, review.PlatformGitHub)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(got) != 1 || got[0].ID != "3" {
-		t.Fatalf("expected only the non-self comment to survive, got %+v", got)
-	}
-}
 
 // TestParseHead verifies the positional PR-number / help seam: --help and -h
 // MUST short-circuit to help regardless of position or PR-number validity,

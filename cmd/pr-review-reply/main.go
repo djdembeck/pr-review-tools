@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -322,6 +323,7 @@ func truncate(s string, n int) string {
 func main() {
 	opts := parseArgs(os.Args)
 
+	ctx := context.Background()
 	remote, err := review.GetGitRemote()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -341,9 +343,9 @@ func main() {
 	if botName == "" {
 		switch platform {
 		case review.PlatformGitHub:
-			botName, _ = review.DetectGitHubBotName(owner, repo, opts.prNumber)
+			botName, _ = review.DetectGitHubBotName(ctx, owner, repo, opts.prNumber)
 		case review.PlatformForgejo:
-			botName, _ = review.DetectForgejoBotName(owner, repo, opts.prNumber)
+			botName, _ = review.DetectForgejoBotName(ctx, owner, repo, opts.prNumber)
 		}
 		if opts.act == actionDetectBot {
 			fmt.Println(botName)
@@ -359,13 +361,13 @@ func main() {
 
 	postReply := func(cid, body string) review.ReplyResult {
 		if platform == review.PlatformGitHub {
-			res, _ := review.PostGitHubReply(owner, repo, opts.prNumber, cid, body, opts.dryRun)
+			res, _ := review.PostGitHubReply(ctx, owner, repo, opts.prNumber, cid, body, opts.dryRun)
 			if opts.dryRun {
 				fmt.Fprintf(os.Stderr, "  [dry-run] Would reply to comment %s: %s...\n", cid, truncate(body, 80))
 			}
 			return res
 		}
-		res, _ := review.PostForgejoReply(owner, repo, opts.prNumber, cid, body, opts.dryRun)
+		res, _ := review.PostForgejoReply(ctx, owner, repo, opts.prNumber, cid, body, opts.dryRun)
 		if opts.dryRun {
 			fmt.Fprintf(os.Stderr, "  [dry-run] Would reply to comment %s: %s...\n", cid, truncate(body, 80))
 		}
@@ -385,7 +387,7 @@ func main() {
 	// Batch actions decide resolve needs per entry; always allow the resolver
 	// to fall back to a lazily-issued fetch if a batch requests resolution.
 	if needPrefetch {
-		preFetched, preFetchErr = review.FetchGitHubComments(owner, repo, opts.prNumber)
+		preFetched, preFetchErr = review.FetchGitHubComments(ctx, owner, repo, opts.prNumber)
 	}
 
 	// resolveComment performs one resolve request against the (possibly
@@ -409,7 +411,7 @@ func main() {
 			return res
 		}
 		if preFetched == nil {
-			preFetched, preFetchErr = review.FetchGitHubComments(owner, repo, opts.prNumber)
+			preFetched, preFetchErr = review.FetchGitHubComments(ctx, owner, repo, opts.prNumber)
 			if preFetchErr != nil {
 				res.Success = false
 				res.Error = preFetchErr.Error()
@@ -422,7 +424,7 @@ func main() {
 			res.Error = fmt.Sprintf("no review thread contains comment %s on PR %d", rr.commentID, opts.prNumber)
 			return res
 		}
-		gRes, _ := review.ResolveGitHubThread(owner, repo, opts.prNumber, threadID, false)
+		gRes, _ := review.ResolveGitHubThread(ctx, owner, repo, opts.prNumber, threadID, false)
 		gRes.CommentID = rr.commentID
 		gRes.Action = "resolve"
 		return gRes

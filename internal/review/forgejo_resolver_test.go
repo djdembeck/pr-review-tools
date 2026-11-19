@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func TestFetchForgejoCommentsResolverMapping(t *testing.T) {
 	defer srv.Close()
 	setTestEnv(t, srv)
 
-	got, err := FetchForgejoComments("own", "rp", 7)
+	got, err := FetchForgejoComments(context.Background(), "own", "rp", 7)
 	if err != nil {
 		t.Fatalf("FetchForgejoComments: %v", err)
 	}

@@ -3,6 +3,7 @@
 build:
 	go build -o bin/pr-review-parser ./cmd/pr-review-parser
 	go build -o bin/pr-review-reply ./cmd/pr-review-reply
+	go build -o bin/pr-review-watch ./cmd/pr-review-watch
 
 clean:
 	rm -rf bin/
