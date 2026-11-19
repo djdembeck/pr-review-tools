@@ -164,6 +164,36 @@ func FetchGitHubComments(owner, repo string, prNumber int) ([]RawComment, error)
 	return mapThreadsToRawComments(threads), nil
 }
 
+// FetchGitHubReviews fetches the PR's full review list (bodies included) via
+// the gh CLI REST API. gh api --paginate merges all pages of a list endpoint
+// into one JSON array.
+func FetchGitHubReviews(owner, repo string, prNumber int) ([]coderabbitReview, error) {
+	output, err := ghRunGuarded([]string{"api",
+		fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber),
+		"--paginate"})
+	if err != nil {
+		return nil, err
+	}
+	var reviews []coderabbitReview
+	if err := json.Unmarshal([]byte(output), &reviews); err != nil {
+		return nil, fmt.Errorf("parse GitHub reviews: %w", err)
+	}
+	return reviews, nil
+}
+
+// FetchGitHubCoderabbitFindings fetches the PR's reviews and returns the
+// outside-diff findings from the NEWEST CodeRabbit review body. CodeRabbit
+// posts a new review per commit range, so older reviews' findings are stale;
+// body findings carry no outdated flag, so newest-only selection is the
+// staleness guard (the same reason inline threads are dropped when outdated).
+func FetchGitHubCoderabbitFindings(owner, repo string, prNumber int) ([]RawComment, error) {
+	reviews, err := FetchGitHubReviews(owner, repo, prNumber)
+	if err != nil {
+		return nil, err
+	}
+	return collectCoderabbitFindings(reviews), nil
+}
+
 // checkGitHubGraphQLPage unmarshals a GITHUB_GRAPHQL response page and reports
 // GraphQL errors or a missing data envelope.
 func checkGitHubGraphQLPage(resp *graphQLResponse, raw string) error {

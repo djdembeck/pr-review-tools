@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -671,5 +672,112 @@ func TestGitCommitTimeHead(t *testing.T) {
 	}
 	if ts.IsZero() {
 		t.Fatal("expected non-zero HEAD commit time")
+	}
+}
+
+// ghReviewJSON renders one GitHub REST review with the fields the
+// coderabbitReview shape consumes.
+func ghReviewJSON(id int64, body, submittedAt, login string) string {
+	var sa string
+	if submittedAt != "" {
+		sa = `"submitted_at":` + strconv.Quote(submittedAt)
+	} else {
+		sa = `"submitted_at":null`
+	}
+	return fmt.Sprintf(`{"id":%d,"body":%q,%s,"user":{"login":%q}}`, id, body, sa, login)
+}
+
+// TestFetchGitHubCoderabbitFindings drives FetchGitHubCoderabbitFindings
+// against a fake gh runner: only the NEWEST CodeRabbit review's outside-diff
+// findings are emitted; non-CodeRabbit, pending, and older reviews
+// contribute nothing; the review list endpoint is fetched exactly once.
+func TestFetchGitHubCoderabbitFindings(t *testing.T) {
+	var captured [][]string
+
+	setGhRunEnv(t, func(args []string) (string, error) {
+		captured = append(captured, append([]string(nil), args...))
+		if args[1] == "graphql" {
+			return "", fmt.Errorf("unexpected graphql fetch: %v", args)
+		}
+		out := `[` +
+			ghReviewJSON(5960230346, crMinimalBody("old.go", 1, "older finding"), "2026-01-01T00:00:00Z", "coderabbitai[bot]") + "," +
+			ghReviewJSON(5967471268, crMinimalBody("new.go", 2, "newer finding"), "2026-01-02T00:00:00Z", "coderabbitai[bot]") + "," +
+			ghReviewJSON(9990000001, crMinimalBody("human.go", 3, "human finding"), "2026-01-03T00:00:00Z", "some-human") + "," +
+			ghReviewJSON(5967471269, "", "", "coderabbitai[bot]") +
+			`]`
+		return out, nil
+	})
+
+	got, err := FetchGitHubCoderabbitFindings("owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("FetchGitHubCoderabbitFindings: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want exactly the newest CodeRabbit review's 1 finding, got %d: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.Path == nil || *c.Path != "new.go" {
+		t.Fatalf("want the newer review's finding, got path %v", c.Path)
+	}
+	if c.Body != "newer finding" {
+		t.Errorf("body: %q", c.Body)
+	}
+	if !strings.HasPrefix(c.ID, "cr-") {
+		t.Errorf("ID %q must have the cr- prefix", c.ID)
+	}
+	if c.Author != "coderabbitai[bot]" {
+		t.Errorf("author: %q", c.Author)
+	}
+	if c.CreatedAt == nil || *c.CreatedAt != "2026-01-02T00:00:00Z" {
+		t.Errorf("createdAt: %v", c.CreatedAt)
+	}
+
+	// The review list endpoint was fetched exactly once, with --paginate.
+	if len(captured) != 1 {
+		t.Fatalf("want exactly one gh invocation, got %d: %v", len(captured), captured)
+	}
+	want := []string{"api", "repos/owner/repo/pulls/42/reviews", "--paginate"}
+	if len(captured[0]) != len(want) {
+		t.Fatalf("gh invocation args: want %v, got %v", want, captured[0])
+	}
+	for i, w := range want {
+		if captured[0][i] != w {
+			t.Errorf("gh invocation arg %d: want %q, got %q", i, w, captured[0][i])
+		}
+	}
+}
+
+// TestFetchGitHubCoderabbitFindingsNewestWithoutSection verifies newest-only
+// selection when the newest CodeRabbit review has no outside-diff section.
+func TestFetchGitHubCoderabbitFindingsNewestWithoutSection(t *testing.T) {
+	setGhRunEnv(t, func(args []string) (string, error) {
+		if args[1] == "graphql" {
+			t.Error("unexpected graphql fetch")
+			return "", fmt.Errorf("not expected")
+		}
+		out := `[` +
+			ghReviewJSON(1, crMinimalBody("old.go", 1, "older finding"), "2026-01-01T00:00:00Z", "coderabbitai[bot]") + "," +
+			ghReviewJSON(2, "<details>no section</details>", "2026-01-02T00:00:00Z", "coderabbitai[bot]") +
+			`]`
+		return out, nil
+	})
+
+	got, err := FetchGitHubCoderabbitFindings("owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("FetchGitHubCoderabbitFindings: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want 0 findings (newest review has no section), got %d: %+v", len(got), got)
+	}
+}
+
+// TestFetchGitHubCoderabbitFindingsSeamError verifies gh/API failures
+// propagate.
+func TestFetchGitHubCoderabbitFindingsSeamError(t *testing.T) {
+	setGhRunEnv(t, func(args []string) (string, error) {
+		return "", fmt.Errorf("boom")
+	})
+	if _, err := FetchGitHubCoderabbitFindings("owner", "repo", 42); err == nil {
+		t.Fatal("want an error when the gh seam fails")
 	}
 }

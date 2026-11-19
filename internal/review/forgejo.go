@@ -143,6 +143,32 @@ func FetchForgejoComments(owner, repo string, prNumber int) ([]RawComment, error
 	return allComments, nil
 }
 
+// FetchForgejoReviews fetches the PR's full review list (bodies included)
+// from GET repos/{owner}/{repo}/pulls/{n}/reviews. Each item carries id,
+// body, submitted_at, and user.login.
+func FetchForgejoReviews(owner, repo string, prNumber int) ([]coderabbitReview, error) {
+	reviewsRaw, err := forgejoGet(fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber))
+	if err != nil {
+		return nil, err
+	}
+	var reviews []coderabbitReview
+	if err := json.Unmarshal([]byte(reviewsRaw), &reviews); err != nil {
+		return nil, fmt.Errorf("parse Forgejo reviews: %w", err)
+	}
+	return reviews, nil
+}
+
+// FetchForgejoCoderabbitFindings fetches the PR's reviews and returns the
+// outside-diff findings from the NEWEST CodeRabbit review body (newest-only
+// selection, same staleness guard as the GitHub path).
+func FetchForgejoCoderabbitFindings(owner, repo string, prNumber int) ([]RawComment, error) {
+	reviews, err := FetchForgejoReviews(owner, repo, prNumber)
+	if err != nil {
+		return nil, err
+	}
+	return collectCoderabbitFindings(reviews), nil
+}
+
 // findForgejoReviewIDForComment returns the review ID and the matched comment
 // for the given comment ID by iterating over the PR's reviews.
 func findForgejoReviewIDForComment(owner, repo string, prNumber int, commentID string) (string, forgejoComment, error) {

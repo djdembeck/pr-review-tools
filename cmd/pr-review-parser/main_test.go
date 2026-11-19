@@ -135,6 +135,7 @@ func TestUsageTextComplete(t *testing.T) {
 		"--trusted-authors <csv>",
 		"--include-self",
 		"--include-outdated",
+		"--coderabbit",
 		"--since <ref|RFC3339>",
 		"--since-last-commit",
 		"--since-last-push",
@@ -276,6 +277,14 @@ func TestFlagParseAuthorsSubprocess(t *testing.T) {
 			// git/fetch stage, never with a flag-parsing error.
 			name:          "authors valid CSV passes flag parsing",
 			args:          []string{"99999", "--authors", "alice , bob"},
+			wantCode:      1,
+			wantNotOutput: "flag-shaped",
+		},
+		{
+			// Flag parsing succeeds; the run must fail (if at all) at the
+			// git/fetch stage, never with a flag-parsing error.
+			name:          "coderabbit passes flag parsing",
+			args:          []string{"99999", "--coderabbit"},
 			wantCode:      1,
 			wantNotOutput: "flag-shaped",
 		},
