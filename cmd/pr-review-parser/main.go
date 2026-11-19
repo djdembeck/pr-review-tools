@@ -36,6 +36,9 @@ Flags:
                             Pass your review bot's exact login (e.g. miracodeai-bot) to receive its agent prompts — without it, NO author's agent prompts are emitted.
   --include-self            Include comments authored by the authenticated user (default: exclude)
   --include-outdated        Include outdated threads (default: exclude)
+  --coderabbit            Parse CodeRabbit review-body "Outside diff comments" findings as comments (default: off).
+                            These findings are OUTPUT-ONLY: they have no real comment ID (the synthetic cr-… ID
+                            cannot be replied to), so post them as body findings, not via pr-review-reply.
   --since <ref|RFC3339>     Only comments created after this git ref's commit time or timestamp
   --since-last-commit       Only comments created after HEAD
   --since-last-push         Only comments created after the upstream tracking branch (@{u})
@@ -69,6 +72,7 @@ func main() {
 	includeResolved := false
 	includeSelf := false
 	includeOutdated := false
+	coderabbit := false
 	var authors []string
 	var trustedAuthors []string
 	var sinceFlag string
@@ -121,6 +125,8 @@ func main() {
 			includeSelf = true
 		case "--include-outdated":
 			includeOutdated = true
+		case "--coderabbit":
+			coderabbit = true
 		case "--since":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
 				sinceFlag = args[i+1]
@@ -200,6 +206,22 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "- Fetched %d total review comments\n", len(rawComments))
+
+	if coderabbit {
+		var extra []review.RawComment
+		switch platform {
+		case review.PlatformGitHub:
+			extra, err = review.FetchGitHubCoderabbitFindings(ctx, owner, repo, prNumber)
+		case review.PlatformForgejo:
+			extra, err = review.FetchForgejoCoderabbitFindings(ctx, owner, repo, prNumber)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error fetching CodeRabbit findings: %v\n", err)
+			os.Exit(1)
+		}
+		rawComments = append(rawComments, extra...)
+		fmt.Fprintf(os.Stderr, "- Fetched %d CodeRabbit body finding(s)\n", len(extra))
+	}
 
 	// The shared relevance pipeline (internal/review) owns the root/author,
 	// resolved, outdated, and self stages; no baseline capture here.

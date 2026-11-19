@@ -434,3 +434,63 @@ func TestFindForgejoReviewIDForCommentNotFound(t *testing.T) {
 		t.Fatalf("expected 'not found' in error, got: %v", testErr)
 	}
 }
+
+// TestFetchForgejoCoderabbitFindings verifies that CodeRabbit review bodies
+// yield findings while human-authored bodies do not.
+func TestFetchForgejoCoderabbitFindings(t *testing.T) {
+	var err captureError
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/repos/owner/repo/pulls/42/reviews" {
+			err.fatal("unexpected path: %s", r.URL.Path)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"id":           1,
+				"body":         crMinimalBody("f.go", 7, "body finding"),
+				"submitted_at": "2026-01-01T00:00:00Z",
+				"user":         map[string]any{"login": "coderabbitai[bot]"},
+			},
+			{
+				"id":           2,
+				"body":         crMinimalBody("h.go", 8, "human finding"),
+				"submitted_at": "2026-01-02T00:00:00Z",
+				"user":         map[string]any{"login": "some-human"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	setTestEnv(t, srv)
+
+	got, testErr := FetchForgejoCoderabbitFindings(context.Background(), "owner", "repo", 42)
+	err.check(t)
+	if testErr != nil {
+		t.Fatalf("FetchForgejoCoderabbitFindings: %v", testErr)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 finding (CodeRabbit body only), got %d: %+v", len(got), got)
+	}
+	if *got[0].Path != "f.go" || *got[0].StartLine != 7 || *got[0].Line != 7 {
+		t.Fatalf("wrong finding: %+v", got[0])
+	}
+	if got[0].Body != "body finding" {
+		t.Errorf("body: %q", got[0].Body)
+	}
+}
+
+// TestFetchForgejoCoderabbitFindingsAPIError verifies API failures propagate.
+func TestFetchForgejoCoderabbitFindingsAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	setTestEnv(t, srv)
+
+	if _, err := FetchForgejoCoderabbitFindings(context.Background(), "owner", "repo", 42); err == nil {
+		t.Fatal("want an error on 500 response")
+	}
+}

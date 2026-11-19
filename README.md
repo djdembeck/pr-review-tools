@@ -109,6 +109,14 @@ bin/pr-review-parser 123 --since-last-commit   # comments after HEAD
 bin/pr-review-parser 123 --since abc123        # comments after any git ref, or an RFC3339 timestamp
 ```
 
+CodeRabbit caps its inline comments, so findings that exceed the cap (or target lines outside the diff) exist only as text inside its latest review body. `--coderabbit` parses the "Outside diff comments" section of the CodeRabbit review that carries findings (newest first) into the same comment stream, on both GitHub and Forgejo:
+
+```bash
+bin/pr-review-parser 123 --coderabbit
+```
+
+These findings are **output-only**: they carry a synthetic `cr-…` ID, no thread, and no diff hunk, so `pr-review-reply` cannot reply to or resolve them. Treat them like the inline-comment text of the review body — read and fix them, and address them in a normal PR comment.
+
 ### Watching
 
 Block until a reviewer posts: the watch tool persistently polls the PR and exits as soon as a **new** review comment appears.
