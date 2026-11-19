@@ -747,8 +747,9 @@ func TestFetchGitHubCoderabbitFindings(t *testing.T) {
 	}
 }
 
-// TestFetchGitHubCoderabbitFindingsNewestWithoutSection verifies newest-only
-// selection when the newest CodeRabbit review has no outside-diff section.
+// TestFetchGitHubCoderabbitFindingsNewestWithoutSection verifies the
+// newest-first walk: when the newest CodeRabbit review has no outside-diff
+// section, the walk falls back to the older review that carries findings.
 func TestFetchGitHubCoderabbitFindingsNewestWithoutSection(t *testing.T) {
 	setGhRunEnv(t, func(args []string) (string, error) {
 		if args[1] == "graphql" {
@@ -766,8 +767,11 @@ func TestFetchGitHubCoderabbitFindingsNewestWithoutSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchGitHubCoderabbitFindings: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("want 0 findings (newest review has no section), got %d: %+v", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("want 1 finding (walk falls back to the older review), got %d: %+v", len(got), got)
+	}
+	if got[0].Path == nil || *got[0].Path != "old.go" {
+		t.Fatalf("want the older review's finding, got %+v", got[0])
 	}
 }
 

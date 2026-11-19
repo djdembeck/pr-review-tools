@@ -151,6 +151,82 @@ func TestParseCoderabbitOutsideDiffFindings(t *testing.T) {
 	}
 }
 
+// TestParseCoderabbitPromptWordings verifies each observed CodeRabbit
+// <summary> phrasing gates the same parse.
+func TestParseCoderabbitPromptWordings(t *testing.T) {
+	for _, summary := range []string{
+		"Prompt to fix all issues",
+		"Prompt to fix review comments",
+		"Prompt for all review comments with AI agents",
+		"Prompt for AI Agents",
+	} {
+		t.Run(summary, func(t *testing.T) {
+			body := "<summary>" + summary + "</summary>\n" +
+				crFence + "\n" +
+				"Outside diff comments:\n" +
+				"Review comments at @f.go:\n" +
+				"- Line 7: a finding\n" +
+				crFence
+			review := crReview("9", body, "2026-01-01T00:00:00Z", "coderabbitai[bot]")
+			got := ParseCoderabbitOutsideDiffFindings(review)
+			if len(got) != 1 || *got[0].Path != "f.go" || *got[0].StartLine != 7 {
+				t.Fatalf("summary %q: want 1 finding at f.go:7, got %+v", summary, got)
+			}
+		})
+	}
+}
+
+// TestParseCoderabbitInBacktickGroup verifies the "In `@path`:" group-prefix
+// variant parses to the same path as the "Review comments at @" form.
+func TestParseCoderabbitInBacktickGroup(t *testing.T) {
+	body := "Prompt to fix all issues\n" +
+		crFence + "\n" +
+		"Outside diff comments:\n" +
+		"In `@agents/code-reviewer.md`:\n" +
+		"- Around line 61-74: trim the checklist\n" +
+		crFence
+	review := crReview("4921214429", body, "2026-01-01T00:00:00Z", "coderabbitai[bot]")
+	got := ParseCoderabbitOutsideDiffFindings(review)
+	if len(got) != 1 {
+		t.Fatalf("want 1 finding, got %+v", got)
+	}
+	c := got[0]
+	if c.Path == nil || *c.Path != "agents/code-reviewer.md" {
+		t.Fatalf("path: want agents/code-reviewer.md (no leading @), got %v", c.Path)
+	}
+	if c.StartLine == nil || *c.StartLine != 61 || c.Line == nil || *c.Line != 74 {
+		t.Fatalf("lines: start=%v end=%v", c.StartLine, c.Line)
+	}
+}
+
+// TestParseCoderabbitEpilogue verifies the prompt-block epilogue is excluded
+// from the last finding's body, both as a trailing paragraph and as the
+// section terminator.
+func TestParseCoderabbitEpilogue(t *testing.T) {
+	body := "Prompt to fix all issues\n" +
+		crFence + "\n" +
+		"Outside diff comments:\n" +
+		"Review comments at @src/app.ts:\n" +
+		"- Line 8: update the example to parser-compatible decimal points.\n" +
+		"\n" +
+		"After applying the fix, consider running `coderabbit review --agent` for local\n" +
+		"review. Visit https://docs.coderabbit.ai/cli?utm_source=ghpr\n" +
+		crFence + "\n" +
+		"</dd>"
+	review := crReview("5729945191", body, "2026-01-01T00:00:00Z", "coderabbitai[bot]")
+	got := ParseCoderabbitOutsideDiffFindings(review)
+	if len(got) != 1 {
+		t.Fatalf("want 1 finding, got %+v", got)
+	}
+	c := got[0]
+	if c.Body != "update the example to parser-compatible decimal points." {
+		t.Fatalf("body must not carry the epilogue:\n%q", c.Body)
+	}
+	if c.StartLine == nil || *c.StartLine != 8 || c.Line == nil || *c.Line != 8 {
+		t.Fatalf("lines: start=%v end=%v", c.StartLine, c.Line)
+	}
+}
+
 // assertCRMeta checks the platform-independent RawComment fields that must be
 // set identically on every synthetic finding.
 func assertCRMeta(t *testing.T, label string, c *RawComment, author, submittedAt string) {
@@ -232,27 +308,58 @@ func TestParseCoderabbitDedupe(t *testing.T) {
 func TestCollectCoderabbitFindings(t *testing.T) {
 	cr := "coderabbitai[bot]"
 
-	t.Run("newer review without section wins, older findings dropped", func(t *testing.T) {
+	t.Run("newer review without section is skipped, older findings kept", func(t *testing.T) {
 		reviews := []coderabbitReview{
 			crReview("1", crMinimalBody("a.go", 1, "older finding"), "2026-01-01T00:00:00Z", cr),
 			crReview("2", "<details>no section here</details>", "2026-01-02T00:00:00Z", cr),
 		}
-		if got := collectCoderabbitFindings(reviews); len(got) != 0 {
-			t.Fatalf("want 0 findings (newest has no section), got %d", len(got))
+		got := collectCoderabbitFindings(reviews)
+		if len(got) != 1 || *got[0].Path != "a.go" {
+			t.Fatalf("want the older review's finding (newer has no section), got %+v", got)
 		}
 	})
 
-	t.Run("newest review's findings are the only ones emitted", func(t *testing.T) {
+	t.Run("empty newest status review is skipped, older findings kept", func(t *testing.T) {
+		// Mirrors the live case: CodeRabbit posts an empty-body APPROVED
+		// review minutes after its substantive one.
+		reviews := []coderabbitReview{
+			crReview("1", crMinimalBody("a.go", 1, "real finding"), "2026-01-01T00:00:00Z", cr),
+			crReview("2", "", "2026-01-01T00:04:00Z", cr),
+		}
+		got := collectCoderabbitFindings(reviews)
+		if len(got) != 1 || *got[0].Path != "a.go" || got[0].Body != "real finding" {
+			t.Fatalf("want the older review's finding past the empty newest review, got %+v", got)
+		}
+	})
+
+	t.Run("newer review with its own findings wins over older", func(t *testing.T) {
 		reviews := []coderabbitReview{
 			crReview("1", crMinimalBody("a.go", 1, "older finding"), "2026-01-01T00:00:00Z", cr),
 			crReview("2", crMinimalBody("b.go", 2, "newer finding"), "2026-01-02T00:00:00Z", cr),
 		}
 		got := collectCoderabbitFindings(reviews)
-		if len(got) != 1 {
-			t.Fatalf("want 1 finding, got %d: %+v", len(got), got)
+		if len(got) != 1 || *got[0].Path != "b.go" {
+			t.Fatalf("want the newer review's finding, got %+v", got)
 		}
-		if *got[0].Path != "b.go" || got[0].Body != "newer finding" {
-			t.Fatalf("wrong finding selected: %+v", got[0])
+	})
+
+	t.Run("human login containing the substring is not a candidate", func(t *testing.T) {
+		reviews := []coderabbitReview{
+			crReview("1", crMinimalBody("a.go", 1, "sneaky finding"), "2026-01-01T00:00:00Z", "coderabbit-helper"),
+			crReview("2", crMinimalBody("b.go", 2, "bot finding"), "2026-01-01T00:00:00Z", cr),
+		}
+		got := collectCoderabbitFindings(reviews)
+		if len(got) != 1 || *got[0].Path != "b.go" {
+			t.Fatalf("want only the exact bot login's finding, got %+v", got)
+		}
+	})
+
+	t.Run("exact login match is case-insensitive", func(t *testing.T) {
+		reviews := []coderabbitReview{
+			crReview("1", crMinimalBody("a.go", 1, "case finding"), "2026-01-01T00:00:00Z", "CoderabbitAI[Bot]"),
+		}
+		if got := collectCoderabbitFindings(reviews); len(got) != 1 {
+			t.Fatalf("want the case-variant bot login's finding, got %+v", got)
 		}
 	})
 

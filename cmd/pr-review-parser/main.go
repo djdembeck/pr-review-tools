@@ -35,7 +35,9 @@ Flags:
                             Pass your review bot's exact login (e.g. miracodeai-bot) to receive its agent prompts — without it, NO author's agent prompts are emitted.
   --include-self            Include comments authored by the authenticated user (default: exclude)
   --include-outdated        Include outdated threads (default: exclude)
-  --coderabbit            Parse CodeRabbit review-body "Outside diff comments" findings as comments (default: off)
+  --coderabbit            Parse CodeRabbit review-body "Outside diff comments" findings as comments (default: off).
+                            These findings are OUTPUT-ONLY: they have no real comment ID (the synthetic cr-… ID
+                            cannot be replied to), so post them as body findings, not via pr-review-reply.
   --since <ref|RFC3339>     Only comments created after this git ref's commit time or timestamp
   --since-last-commit       Only comments created after HEAD
   --since-last-push         Only comments created after the upstream tracking branch (@{u})

@@ -159,8 +159,8 @@ func FetchForgejoReviews(owner, repo string, prNumber int) ([]coderabbitReview, 
 }
 
 // FetchForgejoCoderabbitFindings fetches the PR's reviews and returns the
-// outside-diff findings from the NEWEST CodeRabbit review body (newest-only
-// selection, same staleness guard as the GitHub path).
+// outside-diff findings from the newest CodeRabbit review that carries them
+// (newest-first walk, same selection as the GitHub path).
 func FetchForgejoCoderabbitFindings(owner, repo string, prNumber int) ([]RawComment, error) {
 	reviews, err := FetchForgejoReviews(owner, repo, prNumber)
 	if err != nil {

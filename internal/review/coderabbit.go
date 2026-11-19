@@ -5,19 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// coderabbitAuthorSubstring matches CodeRabbit review authors case-insensitively
-// (covers coderabbitai[bot]; a human login containing the substring is an
-// accepted edge).
-const coderabbitAuthorSubstring = "coderabbit"
+// coderabbitBotLogin is the exact review-author login CodeRabbit posts under.
+// Exact (case-insensitive) matching keeps a human login that merely contains
+// the substring (e.g. coderabbit-helper) from entering newest-review
+// selection, where it could suppress the genuine bot's findings.
+const coderabbitBotLogin = "coderabbitai[bot]"
 
 // coderabbitReview is the subset of a GitHub/Forgejo PR review this parser
-// needs: the body (where CodeRabbit writes its "Prompt to fix all issues"
-// block), the submission timestamp, and the author login.
+// needs: the body (where CodeRabbit writes its agent-prompt block, whose
+// <summary> line carries one of the crPromptSummaries phrasings), the
+// submission timestamp, and the author login.
 type coderabbitReview struct {
 	ID          json.Number `json:"id"`
 	Body        string      `json:"body"`
@@ -31,13 +34,42 @@ type coderabbitReview struct {
 // CodeRabbit "Prompt to fix all issues" block. The section runs to the next
 // sibling section header ("Minor comments:" / "Failed pre-merge checks:"), a
 // trailing "---" separator, or the end of the text.
-var reCRSection = regexp.MustCompile(`(?m)^Outside diff comments:\r?\n([\s\S]*?)(?:\n(?:Minor comments:|Failed pre-merge checks:)|\n---\r?$|\z)`)
+// crEpilogueStart ends the prompt-block epilogue ("After applying the fix,
+// consider running … Visit https://docs.coderabbit.ai/cli?…") when it appears
+// at the end of the section, inside the fence. The section parser stops the
+// last finding at this line.
+const crEpilogueStart = "After applying the fix"
+
+// reCRSection locates the "Outside diff comments:" section inside the
+// CodeRabbit prompt block. The section runs to the next sibling section
+// header ("Minor comments:" / "Failed pre-merge checks:"), a trailing "---"
+// separator, the epilogue, or the end of the text.
+var reCRSection = regexp.MustCompile(`(?m)^Outside diff comments:\r?\n([\s\S]*?)(?:\n(?:Minor comments:|Failed pre-merge checks:)|\n---\r?$|\n` + crEpilogueStart + `|\z)`)
+
+// reCRGroupAt matches a "Review comments at @<path>:" file-group header.
+var reCRGroupAt = regexp.MustCompile(`^Review comments at @(.+?):\s*$`)
+
+// reCRGroupIn matches an "In `<path>`:" file-group header, the group-prefix
+// variant CodeRabbit also emits for the same sections.
+var reCRGroupIn = regexp.MustCompile("^In `(.+?)`:\\s*$")
 
 // reCRSingle matches a single-line finding header, e.g. "- Line 1154: …".
 var reCRSingle = regexp.MustCompile(`^\s*[-*]\s+Line (\d+):`)
 
 // reCRRange matches a range finding header, e.g. "- Around line 679-681: …".
 var reCRRange = regexp.MustCompile(`^\s*[-*]\s+Around line (\d+)-(\d+):`)
+
+// crPromptSummaries are the <summary> phrasings CodeRabbit has used for the
+// agent-prompt block whose fence carries the "Outside diff comments:"
+// section. CodeRabbit rewords them between releases, so every observed
+// wording must be accepted; a missing summary line means the review carries
+// no agent-prompt block at all.
+var crPromptSummaries = []string{
+	"Prompt to fix all issues",
+	"Prompt to fix review comments",
+	"Prompt for all review comments",
+	"Prompt for AI Agents",
+}
 
 // ParseCoderabbitOutsideDiffFindings extracts the outside-diff findings from a
 // CodeRabbit review body into RawComment values. CodeRabbit caps its inline
@@ -52,13 +84,12 @@ func ParseCoderabbitOutsideDiffFindings(review coderabbitReview) []RawComment {
 
 	lines := strings.Split(review.Body, "\n")
 
-	// Locate the "Prompt to fix all issues" summary line; the fenced block
-	// starts at the first line that is exactly "```" after it and ends at the
-	// next such line (or runs to the end of the body when the fence is
-	// unclosed).
+	// Locate the prompt-block <summary> line; the fenced block starts at the
+	// first line that is exactly "```" after it and ends at the next such
+	// line (or runs to the end of the body when the fence is unclosed).
 	summaryIdx := -1
 	for i, l := range lines {
-		if strings.Contains(l, "Prompt to fix all issues") {
+		if containsPromptSummary(l) {
 			summaryIdx = i
 			break
 		}
@@ -143,11 +174,22 @@ func ParseCoderabbitOutsideDiffFindings(review coderabbitReview) []RawComment {
 
 	for _, line := range section {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "Review comments at @") {
+		if m := reCRGroupAt.FindStringSubmatch(trimmed); m != nil {
 			flush()
-			path = strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(trimmed, "Review comments at @")), ":")
+			path = m[1]
 			havePath = true
 			continue
+		}
+		if m := reCRGroupIn.FindStringSubmatch(trimmed); m != nil {
+			flush()
+			path = strings.TrimPrefix(m[1], "@")
+			havePath = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, crEpilogueStart) {
+			// The prompt-block epilogue is boilerplate, not a finding.
+			flush()
+			break
 		}
 		if ix := reCRSingle.FindStringSubmatchIndex(line); ix != nil {
 			flush()
@@ -185,19 +227,43 @@ func ParseCoderabbitOutsideDiffFindings(review coderabbitReview) []RawComment {
 	return out
 }
 
-// collectCoderabbitFindings selects the newest CodeRabbit review among
-// reviews and returns its outside-diff findings. CodeRabbit posts a new review
-// per commit range, so findings in older reviews are stale; body findings
-// carry no outdated flag, so newest-only selection is the staleness guard.
+// containsPromptSummary reports whether line contains any of the observed
+// CodeRabbit prompt-block <summary> phrasings (crPromptSummaries).
+func containsPromptSummary(line string) bool {
+	for _, s := range crPromptSummaries {
+		if strings.Contains(line, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCoderabbitAuthor reports whether login is the CodeRabbit bot account
+// (exact, case-insensitive match — a human login merely containing the
+// substring must not participate in selection).
+func isCoderabbitAuthor(login string) bool {
+	return strings.EqualFold(login, coderabbitBotLogin)
+}
+
+// collectCoderabbitFindings walks the CodeRabbit reviews newest to oldest
+// and returns the first review that yields outside-diff findings. CodeRabbit
+// posts a new review per commit range, so a newer review's findings supersede
+// older ones; body findings carry no outdated flag, so newest-first is the
+// staleness guard. Walking (instead of taking only the newest) survives the
+// real-world case where the newest bot review is an empty status review
+// (e.g. APPROVED with body "") that carries no findings at all.
 // Selection compares SubmittedAt instants (never RFC3339 strings — string
 // order is not chronological when offsets differ); reviews with a nil or
-// unparseable SubmittedAt are not candidates; ties are broken by first-in-list.
-// No candidates yields nil.
+// unparseable SubmittedAt are not candidates; ties are broken by
+// first-in-list. No candidate yields findings yields nil.
 func collectCoderabbitFindings(reviews []coderabbitReview) []RawComment {
-	best := -1
-	var bestTime time.Time
+	type candidate struct {
+		index int
+		at    time.Time
+	}
+	var candidates []candidate
 	for i, r := range reviews {
-		if !strings.Contains(strings.ToLower(r.User.Login), coderabbitAuthorSubstring) {
+		if !isCoderabbitAuthor(r.User.Login) {
 			continue
 		}
 		if r.SubmittedAt == nil {
@@ -207,13 +273,15 @@ func collectCoderabbitFindings(reviews []coderabbitReview) []RawComment {
 		if err != nil {
 			continue
 		}
-		if best == -1 || t.After(bestTime) {
-			best = i
-			bestTime = t
+		candidates = append(candidates, candidate{index: i, at: t})
+	}
+	sort.SliceStable(candidates, func(a, b int) bool {
+		return candidates[a].at.After(candidates[b].at)
+	})
+	for _, c := range candidates {
+		if findings := ParseCoderabbitOutsideDiffFindings(reviews[c.index]); findings != nil {
+			return findings
 		}
 	}
-	if best == -1 {
-		return nil
-	}
-	return ParseCoderabbitOutsideDiffFindings(reviews[best])
+	return nil
 }

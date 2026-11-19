@@ -182,10 +182,9 @@ func FetchGitHubReviews(owner, repo string, prNumber int) ([]coderabbitReview, e
 }
 
 // FetchGitHubCoderabbitFindings fetches the PR's reviews and returns the
-// outside-diff findings from the NEWEST CodeRabbit review body. CodeRabbit
-// posts a new review per commit range, so older reviews' findings are stale;
-// body findings carry no outdated flag, so newest-only selection is the
-// staleness guard (the same reason inline threads are dropped when outdated).
+// outside-diff findings from the newest CodeRabbit review that carries them
+// (newest-first walk; see collectCoderabbitFindings for the staleness guard
+// and the empty-status-review case).
 func FetchGitHubCoderabbitFindings(owner, repo string, prNumber int) ([]RawComment, error) {
 	reviews, err := FetchGitHubReviews(owner, repo, prNumber)
 	if err != nil {

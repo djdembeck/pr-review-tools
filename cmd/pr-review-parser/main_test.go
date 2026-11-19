@@ -230,11 +230,12 @@ func TestFlagParseAuthorsSubprocess(t *testing.T) {
 	bin := buildParserBinary(t)
 
 	cases := []struct {
-		name          string
-		args          []string
-		wantCode      int
-		wantInOutput  string // substring that MUST appear
-		wantNotOutput string // substring that MUST NOT appear
+		name           string
+		args           []string
+		wantCode       int
+		wantInOutput   string // substring that MUST appear
+		wantNotOutput  string // substring that MUST NOT appear
+		wantNotOutputs []string
 	}{
 		{
 			name:         "authors flag-shaped value rejected",
@@ -282,11 +283,15 @@ func TestFlagParseAuthorsSubprocess(t *testing.T) {
 		},
 		{
 			// Flag parsing succeeds; the run must fail (if at all) at the
-			// git/fetch stage, never with a flag-parsing error.
-			name:          "coderabbit passes flag parsing",
-			args:          []string{"99999", "--coderabbit"},
-			wantCode:      1,
-			wantNotOutput: "flag-shaped",
+			// git/fetch stage, never with a flag-parsing error. Reject the
+			// flag package's unknown-flag diagnostics as well ("flag
+			// provided but not defined" / "unknown flag"), so deleting the
+			// --coderabbit switch branch makes this test fail.
+			name:           "coderabbit passes flag parsing",
+			args:           []string{"99999", "--coderabbit"},
+			wantCode:       1,
+			wantNotOutput:  "flag-shaped",
+			wantNotOutputs: []string{"not defined", "unknown flag"},
 		},
 	}
 	for _, tt := range cases {
@@ -300,6 +305,11 @@ func TestFlagParseAuthorsSubprocess(t *testing.T) {
 			}
 			if tt.wantNotOutput != "" && strings.Contains(out, tt.wantNotOutput) {
 				t.Fatalf("output must not contain %q:\n%s", tt.wantNotOutput, out)
+			}
+			for _, banned := range tt.wantNotOutputs {
+				if strings.Contains(out, banned) {
+					t.Fatalf("output must not contain %q:\n%s", banned, out)
+				}
 			}
 		})
 	}
